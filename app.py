@@ -213,7 +213,7 @@ with tab2:
                 "% Спешат (Pacing)": "{:.1f}%",
                 "% Хаос (Cohesion)": "{:.1f}%",
                 "% Петли (3+ ошибок)": "{:.1f}%"
-            }).applymap(lambda v: "background-color: #FADBD8" if isinstance(v, (int, float)) and v > 20 else ""),
+            }).map(lambda v: "background-color: #FADBD8" if isinstance(v, (int, float)) and v > 20 else ""),
             use_container_width=True
         )
         st.caption("Красным подсвечены значения, превышающие нормативные пороги LXD-модели (отвал > 15%, метрики > 20%).")
