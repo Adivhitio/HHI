@@ -1,1059 +1,1179 @@
-# -*- coding: utf-8 -*-
-# Dashboard build: 2026-11-12-py314
-from __future__ import annotations
-
-import argparse
-from datetime import date
-from html import escape
-from io import BytesIO
-import json
-from pathlib import Path
-from zipfile import ZIP_DEFLATED, ZipFile
-
-import numpy as np
+import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import streamlit as st
 
-AS_OF = pd.Timestamp("2026-11-12")
-BUILD_ID = "2026-11-12-py314"
-COLORS = {"green": "#157B62", "yellow": "#A66A09", "red": "#BD414B", "gray": "#748295"}
-BG = {"green": "#E9F5EF", "yellow": "#FFF3DA", "red": "#FCEBEC", "gray": "#EDF0F4"}
-ICONS = {"green": "🟢", "yellow": "🟡", "red": "🔴", "gray": "⚪"}
-ZONES = {"green": "Целевая зона", "yellow": "Зона внимания", "red": "Зона риска", "gray": "Мало данных"}
-QUESTIONS = {"q4": "В4 · Теория", "q5": "В5 · Актуальность", "q6": "В6 · Задания",
-             "q7": "В7 · Эксперты", "q8": "В8 · Скорость", "q9": "В9 · Забота"}
-MODULE_NAMES = ["Старт и инструменты", "Базовые приёмы", "Практика на кейсах",
-                "Сложные задачи", "Сборка решения", "Финальный модуль"]
-PROFILES = {
-    "healthy": (.82, .88, .68, "Сбалансированный бенчмарк"),
-    "illusion": (.82, .48, .46, "Иллюзия доходимости"),
-    "emotional": (.85, .50, .78, "Эмоциональная ловушка"),
-    "expectations": (.69, .47, .16, "Кризис результата и ожиданий"),
-    "filter": (.42, .88, .42, "Синдром жёсткого фильтра"),
-    "crisis": (.38, .43, .04, "Системный кризис"),
-    "fallback": (.61, .68, .43, "Промежуточные показатели"),
-    "low_nps": (.79, .83, .65, "Недостаточный охват NPS"),
-    "small": (.50, .87, .65, "Малая база среза и модулей"),
-    "local": (.83, .86, .62, "Локальная аномалия потока"),
-    "service": (.80, .84, .43, "Сервисные проблемы"),
-    "overload": (.78, .83, .55, "Скрытая перегрузка и усталость"),
-    "low_mhi": (.30, .83, .55, "Низкий охват MHI"),
-    "pending": (.81, .84, .62, "Открытые окна и незакрытая проверка"),
-}
-MACRO = {
-    1: ("Сбалансированный бенчмарк", "green", "Планово", [
-        "Зафиксировать версию программы как базовый эталон.",
-        "Развивать факультативный трек сложных задач для сильных студентов."]),
-    2: ("Иллюзия доходимости", "yellow", "Проверка результата", [
-        "Сопоставить отказ от защиты и несдачу по рубрикатору: это разные причины потерь.",
-        "Проверить избыточные подсказки в промежуточных ДЗ и скачок сложности диплома."]),
-    3: ("Эмоциональная ловушка", "yellow", "Проверка результата", [
-        "Проверить, не заменяет ли зачёт за старание независимую оценку навыка.",
-        "Сопоставить критерии кураторов и независимых ревьюеров итогового проекта."]),
-    4: ("Кризис результата и ожиданий", "red", "P1", [
-        "Найти разрыв теории и практики через аудит модулей.",
-        "Проверить ясность и адекватность требований проекта; подготовить поддерживающий практикум."]),
-    5: ("Синдром жёсткого фильтра", "yellow", "Доступность обучения", [
-        "Найти модуль с резким ростом отсева и спешки.",
-        "Проверить входные требования, поддержку новичков и достаточность опорных примеров."]),
-    6: ("Системный кризис программы", "red", "P0", [
-        "Рассмотреть остановку масштабирования трафика до проверки причин.",
-        "Проверить соответствие программы аудитории и пересобрать подтверждённые проблемные модули."]),
-}
+# =====================================================================
+# КОНФИГУРАЦИЯ СТРАНИЦЫ И СТИЛИ (ЗАЩИТА ОТ СБОЕВ MARKDOWN/HTML)
+# =====================================================================
+st.set_page_config(
+    page_title="Система метрик v1.0 — Системный контур",
+    page_icon="📊",
+    layout="wide",
+)
 
-
-def ratio(a, b):
-    return float(a) / float(b) if b else np.nan
-
-
-def pct(x, digits=1):
-    return "—" if pd.isna(x) else f"{x:.{digits}%}".replace(".", ",")
-
-
-def high_zone(value, green, yellow, valid=True):
-    if not valid or pd.isna(value):
-        return "gray"
-    return "green" if value >= green else "yellow" if value >= yellow else "red"
-
-
-def low_zone(value, yellow, red=None, valid=True):
-    if not valid or pd.isna(value):
-        return "gray"
-    if red is not None and value > red:
-        return "red"
-    return "yellow" if value > yellow else "green"
-
-
-def csi_zone(top, bottom, question, valid):
-    if not valid or pd.isna(top):
-        return "gray"
-    if bottom > .15:
-        return "red"
-    return high_zone(top, .85 if question in ("q4", "q5", "q6") else .88,
-                     .75 if question in ("q4", "q5", "q6") else .80)
-
-
-def _exact_flags(rng, size, rate):
-    result = np.zeros(size, dtype=bool)
-    result[rng.permutation(size)[:round(size * rate)]] = True
-    return result
-
-
-def generate_synthetic_data(seed=42, cohort_size=60):
-    """Индивидуальные записи, а не заранее нарисованные значения KPI.
-
-    14 срезов × 3 последовательных потока; в малом срезе 3 × 8 студентов.
-    Статусы progress — снимки на cutoff (для незакрытых окон предварительные).
-    Каждый продолжающий студент прошёл практику и обязательную анкету ранее.
-    Точное квотирование держит основные демосценарии устойчивыми при смене seed.
-    """
-    rng = np.random.default_rng(int(seed))
-    cohorts, modules, students, progress, pulse = [], [], [], [], []
-    course_sequences = {}
-    for index, (profile, (cr, a_task, nps_target, label)) in enumerate(PROFILES.items()):
-        course = "Аналитик данных" if index < 10 else "Python-разработчик"
-        version = "1.0" if index < 7 else "1.1" if index < 10 else "2.0"
-        slice_id = f"S{index + 1:02d}"
-        for c in range(3):
-            seq_key = (course, version)
-            course_sequences[seq_key] = course_sequences.get(seq_key, 0) + 1
-            seq = course_sequences[seq_key]
-            cid = f"{slice_id}-C{c + 1}"
-            n = 8 if profile == "small" else int(cohort_size)
-            start = AS_OF - pd.Timedelta(days=(len(PROFILES) - index) * 70 + 16 - c * 7)
-            if profile == "pending":
-                start = AS_OF - pd.Timedelta(days=[100, 80, 24][c])
-            deadline = start + pd.Timedelta(days=63)
-            reviews_closed = not (profile == "pending" and c in (1, 2))
-            # В pending: C1 закрыт, C2 окончил, но работы на проверке, C3 ещё учится.
-            cohorts.append(dict(cohort_id=cid, course=course, version=version, slice_id=slice_id,
-                                slice_label=label, profile=profile, cohort_order=seq,
-                                cohort_name=f"Поток {seq:02d}", start_date=start,
-                                assessment_deadline=deadline, reviews_closed=reviews_closed))
-            local_bad = profile == "local" and c == 2
-            this_cr = .40 if local_bad else cr
-            n_finished = round(n * this_cr)
-            n_passed = round(n_finished * a_task)
-            attempted_rate = min(.97, a_task + (.17 if profile in ("illusion", "emotional") else .24))
-            n_attempted = max(n_passed, round(n_finished * attempted_rate))
-            ids = [f"{cid}-U{i + 1:03d}" for i in range(n)]
-            shuffled = list(rng.permutation(ids))
-            final_ids = set(shuffled[:n_finished])
-            attempt_ids = set(shuffled[:n_attempted])
-            pass_ids = set(shuffled[:n_passed])
-            response_count = round(n_finished * (.25 if profile == "low_nps" else .84))
-            responder_ids = list(rng.permutation(list(sorted(final_ids))))[:response_count]
-            detractors = round(response_count * .10)
-            promoters = min(response_count - detractors, round(response_count * nps_target) + detractors)
-            scores = list(rng.integers(9, 11, promoters)) + list(rng.integers(0, 7, detractors))
-            scores += list(rng.integers(7, 9, response_count - len(scores)))
-            rng.shuffle(scores)
-            nps_by_id = dict(zip(responder_ids, scores))
-            terminal = {}
-            for sid in ids:
-                if sid in final_ids:
-                    terminal[sid] = 6
-                elif profile in ("filter", "crisis", "low_mhi") or local_bad:
-                    terminal[sid] = 3 if rng.random() < .85 else int(rng.choice([1, 2, 4, 5]))
-                else:
-                    terminal[sid] = int(rng.integers(1, 6))
-                # Финальные результаты незрелого потока не существуют на дату снимка.
-                ready_final = deadline <= AS_OF
-                students.append(dict(student_id=sid, cohort_id=cid,
-                                     final_attempted=bool(sid in attempt_ids and ready_final),
-                                     final_passed=bool(sid in pass_ids and ready_final),
-                                     nps=nps_by_id.get(sid, np.nan) if ready_final and reviews_closed else np.nan))
-            for module_no, title in enumerate(MODULE_NAMES, 1):
-                module_open = start + pd.Timedelta(days=(module_no - 1) * 7)
-                module_deadline = start + pd.Timedelta(days=module_no * 7)
-                cutoff = module_deadline + pd.Timedelta(days=14)
-                modules.append(dict(cohort_id=cid, module_no=module_no, title=title,
-                                    open_date=module_open, deadline=module_deadline, cutoff_date=cutoff,
-                                    expert_id=f"EXP-{course[:1]}-{module_no}"))
-                if module_open > AS_OF:
-                    continue
-                module_rows = []
-                for sid in ids:
-                    if terminal[sid] < module_no:
-                        continue
-                    continues = terminal[sid] > module_no
-                    if continues or (module_no == 6 and sid in attempt_ids):
-                        state = "passed"
-                    elif module_no == 6:
-                        state = str(rng.choice(["passed", "lagging", "dropped_inactive"], p=[.75, .18, .07]))
-                    else:
-                        choices = ["dropped_official", "dropped_inactive", "lagging", "paused", "passed"]
-                        probs = [.20, .51, .12, .09, .08]
-                        if profile == "low_mhi":
-                            probs = [.15, .62, .13, .07, .03]
-                        state = str(rng.choice(choices, p=probs))
-                    module_rows.append(dict(student_id=sid, cohort_id=cid, module_no=module_no,
-                                            state=state, loop_fail=False))
-                    # Вход на следующий модуль требует заполненной анкеты.
-                    answered = state == "passed" and (continues or sid in attempt_ids or rng.random() < .72)
-                    if answered:
-                        pulse.append(dict(student_id=sid, cohort_id=cid, module_no=module_no,
-                                          pacing="normal", fragmented=False, depleted=False,
-                                          **{q: 5 for q in QUESTIONS}, comment=""))
-                active_indices = [i for i, row in enumerate(module_rows) if row["state"] != "paused"]
-                loop_rate = .05
-                if module_no == 3 and profile in ("illusion", "expectations", "crisis", "filter"):
-                    loop_rate = .30
-                if module_no == 3 and local_bad:
-                    loop_rate = .42
-                for idx in rng.permutation(active_indices)[:round(len(active_indices) * loop_rate)]:
-                    module_rows[idx]["loop_fail"] = True
-                progress.extend(module_rows)
-    data = {"cohorts": pd.DataFrame(cohorts), "modules": pd.DataFrame(modules),
-            "students": pd.DataFrame(students), "progress": pd.DataFrame(progress), "pulse": pd.DataFrame(pulse)}
-    # Точное квотирование ответов внутри каждого потока и модуля.
-    p = data["pulse"]
-    for (cid, mod), group in p.groupby(["cohort_id", "module_no"], sort=False):
-        cohort = data["cohorts"].set_index("cohort_id").loc[cid]
-        profile = cohort["profile"]
-        local_bad = profile == "local" and cid.endswith("C3")
-        rushed, slow, fragmented, depleted = .12, .08, .06, .12
-        if mod == 3 and profile in ("illusion", "expectations", "crisis", "filter"):
-            fragmented, rushed = .30, .36
-        if mod == 3 and local_bad:
-            fragmented = .45
-        if profile == "overload":
-            if mod == 3:
-                rushed = .42
-            if mod in (4, 5):
-                depleted = .38
-            if mod == 2:
-                slow = .30
-        if profile == "low_mhi" and mod == 3:
-            fragmented, depleted = .45, .48  # Серые значения не участвуют в гипотезах MHI.
-        ix = group.index.to_numpy()
-        perm = rng.permutation(ix)
-        n_rushed, n_slow = round(len(ix) * rushed), round(len(ix) * slow)
-        p.loc[perm[:n_rushed], "pacing"] = "rushed"
-        p.loc[perm[n_rushed:n_rushed + n_slow], "pacing"] = "slow"
-        p.loc[ix, "fragmented"] = _exact_flags(rng, len(ix), fragmented)
-        p.loc[ix, "depleted"] = _exact_flags(rng, len(ix), depleted)
-        for q in QUESTIONS:
-            top, bottom = .94, .03
-            if profile in ("illusion", "expectations", "crisis", "filter") and mod == 3 and q == "q6":
-                top, bottom = .64, .21
-            if local_bad and mod == 3 and q in ("q6", "q7"):
-                top, bottom = .50, .30
-            if profile == "service":
-                if (mod == 2 and q == "q5") or (mod == 3 and q == "q7"):
-                    top, bottom = .62, .22
-                if mod == 4 and q in ("q8", "q9"):
-                    top, bottom = .58, .27
-            shuffled_ix = rng.permutation(ix)
-            n_top, n_bottom = round(len(ix) * top), round(len(ix) * bottom)
-            p.loc[ix, q] = 3
-            p.loc[shuffled_ix[:n_top], q] = rng.integers(4, 6, n_top)
-            p.loc[shuffled_ix[n_top:n_top + n_bottom], q] = rng.integers(1, 3, n_bottom)
-        comments = ["Разобранный пример помог самостоятельно выполнить задание.",
-                    "Хотелось бы больше задач повышенной сложности.", "Понятная последовательность и полезная обратная связь."]
-        if fragmented > .20:
-            comments = ["В задании используются термины, которых не было в теории.",
-                        "Автотест выдаёт ошибку без пояснения. Нужен пример входных данных."]
-        if profile == "service" and mod == 4:
-            comments = ["Проверку ждал три дня; не понимал, когда получу ответ.",
-                        "В отзыве перечислены ошибки, но неясно, как их исправить."]
-        if profile == "service" and mod == 2:
-            comments = ["Скриншоты относятся к старой версии инструмента."]
-        if rushed > .30:
-            comments += ["Содержание понятно, но на задание ушло гораздо больше времени, чем заявлено."]
-        for idx in rng.permutation(ix)[:max(1, round(len(ix) * .12))]:
-            p.loc[idx, "comment"] = str(rng.choice(comments))
-    return data
-
-
-@st.cache_data(show_spinner=False, max_entries=8)
-def get_demo_data(seed, cohort_size):
-    return generate_synthetic_data(seed, cohort_size)
-
-
-def slice_cohorts(data, slice_id):
-    result = data["cohorts"].loc[data["cohorts"]["slice_id"].eq(slice_id)].sort_values("cohort_order").copy()
-    if result.empty:
-        raise ValueError("Срез не найден")
-    if len(result[["course", "version"]].drop_duplicates()) != 1:
-        raise ValueError("Срез объединяет разные программы или версии")
-    seq = result["cohort_order"].tolist()
-    if seq != list(range(seq[0], seq[0] + len(seq))):
-        raise ValueError("В срезе должны быть последовательные потоки одной версии")
-    return result
-
-
-def ready_cohorts(cohorts, as_of=AS_OF):
-    """Только закрытый последовательный префикс: не перепрыгиваем через поток в проверке."""
-    ready = cohorts["assessment_deadline"].le(as_of) & cohorts["reviews_closed"]
-    return cohorts.loc[ready.cummin()].copy()
-
-
-def course_metrics(data, cohort_ids):
-    students = data["students"].loc[data["students"]["cohort_id"].isin(cohort_ids)]
-    progress = data["progress"].loc[data["progress"]["cohort_id"].isin(cohort_ids)]
-    finished_keys = set(zip(progress.loc[progress.module_no.eq(6), "cohort_id"],
-                            progress.loc[progress.module_no.eq(6), "student_id"]))
-    finished_mask = [(r.cohort_id, r.student_id) in finished_keys for r in students.itertuples()]
-    finalists = students.loc[finished_mask]
-    enrolled, finished = len(students), len(finalists)
-    attempted, passed = int(finalists.final_attempted.sum()), int(finalists.final_passed.sum())
-    nps_scores = finalists.nps.dropna()
-    nps = 100 * ((nps_scores.ge(9).sum() - nps_scores.le(6).sum()) / len(nps_scores)) if len(nps_scores) else np.nan
-    return dict(enrolled=enrolled, finished=finished, attempted=attempted, passed=passed,
-                cr=ratio(finished, enrolled), a_task=ratio(passed, finished), hi=ratio(passed, enrolled),
-                no_show=ratio(finished - attempted, finished), rubric_fail=ratio(attempted - passed, finished),
-                task_fail=ratio(finished - passed, finished), unconfirmed=ratio(finished - passed, enrolled),
-                nps=nps, nps_n=len(nps_scores), nps_rr=ratio(len(nps_scores), finished),
-                nps_valid=len(nps_scores) >= 15 and ratio(len(nps_scores), finished) >= .5)
-
-
-def macro_scenario(m):
-    if m["enrolled"] < 30:
-        return None
-    # При <20 финалистах концепция разрешает предварительную оценку A_task.
-    if not m["nps_valid"]:
-        return None
-    cr, a, hi, nps = (m[k] for k in ("cr", "a_task", "hi", "nps"))
-    if hi >= .50 and cr >= .65 and a >= .75 and nps >= 50:
-        return 1
-    if cr >= .65 and a < .60 and 35 <= nps <= 60:
-        return 2
-    if cr >= .65 and a < .60 and nps > 60:
-        return 3
-    if cr >= .55 and a < .60 and nps < 35:
-        return 4
-    if cr < .55 and a >= .75 and nps < 50:
-        return 5
-    if hi < .30 and cr < .55 and a < .60 and nps < 35:
-        return 6
-    return None
-
-
-def cohort_comparison(data, cohorts):
-    rows = []
-    for r in cohorts.itertuples():
-        m = course_metrics(data, [r.cohort_id])
-        rows.append(dict(cohort_id=r.cohort_id, name=r.cohort_name, **m))
-    return pd.DataFrame(rows)
-
-
-def isolated_course_anomalies(table):
-    """Для >=3 потоков: ровно один отстоит >20 п.п. от каждого из остальных.
-    Остальные должны иметь размах <=20 п.п. Два потока не локализуют виновника.
-    """
-    flags = []
-    if len(table) < 3:
-        return flags
-    for metric in ("cr", "a_task"):
-        valid = table.dropna(subset=[metric])
-        if len(valid) < 3:
-            continue
-        candidates = []
-        for ix, r in valid.iterrows():
-            others = valid.drop(ix)[metric]
-            if (abs(others - r[metric]) > .20 + 1e-10).all() and others.max() - others.min() <= .20 + 1e-10:
-                candidates.append((r["name"], metric))
-        if len(candidates) == 1:
-            flags.extend(candidates)
-    return flags
-
-
-def module_stats(progress, pulse):
-    started = len(progress)
-    paused = int(progress.state.eq("paused").sum())
-    active = progress.loc[~progress.state.eq("paused")]
-    n = len(active)
-    passed = int(active.state.eq("passed").sum())
-    lagging = int(active.state.eq("lagging").sum())
-    official = int(active.state.eq("dropped_official").sum())
-    inactive = int(active.state.eq("dropped_inactive").sum())
-    m = len(pulse)
-    result = dict(started=started, paused=paused, n=n, passed=passed, lagging=lagging,
-                  dropped=official + inactive, official=official, inactive=inactive,
-                  loop_n=int(active.loop_fail.sum()), drop=ratio(official + inactive, n),
-                  lag=ratio(lagging, n), loop=ratio(active.loop_fail.sum(), n), m=m, rr=ratio(m, n),
-                  rushed=ratio(pulse.pacing.eq("rushed").sum(), m),
-                  slow=ratio(pulse.pacing.eq("slow").sum(), m),
-                  fragmented=ratio(pulse.fragmented.sum(), m), depleted=ratio(pulse.depleted.sum(), m))
-    result["lms_valid"] = n >= 15
-    result["mhi_valid"] = m >= 15 and result["rr"] >= .5
-    for q in QUESTIONS:
-        result[f"{q}_top"] = ratio(pulse[q].ge(4).sum(), m)
-        result[f"{q}_bottom"] = ratio(pulse[q].le(2).sum(), m)
-    return result
-
-
-def module_metrics(data, cohorts, as_of=AS_OF):
-    cohort_ids = cohorts.cohort_id.tolist()
-    enrolled = len(data["students"].loc[data["students"].cohort_id.isin(cohort_ids)])
-    modules = data["modules"].loc[data["modules"].cohort_id.isin(cohort_ids)]
-    completed = set(cohorts.loc[cohorts.assessment_deadline.le(as_of) & cohorts.reviews_closed, "cohort_id"])
-    rows, details = [], []
-    for mod, meta in modules.groupby("module_no", sort=True):
-        eligible = meta.loc[meta.cutoff_date.le(as_of) | meta.cohort_id.isin(completed), "cohort_id"].tolist()
-        prog_all = data["progress"].loc[data["progress"].cohort_id.isin(cohort_ids) & data["progress"].module_no.eq(mod)]
-        prog = prog_all.loc[prog_all.cohort_id.isin(eligible)]
-        p = data["pulse"].loc[data["pulse"].cohort_id.isin(eligible) & data["pulse"].module_no.eq(mod)]
-        row = dict(module_no=int(mod), title=meta.iloc[0].title, closed_cohorts=len(eligible),
-                   total_cohorts=len(cohort_ids), started_total=len(prog_all), enrolled=enrolled,
-                   cor=ratio(len(prog_all), enrolled), **module_stats(prog, p))
-        rows.append(row)
-        for cid in eligible:
-            details.append(dict(module_no=int(mod), cohort_id=cid,
-                                **module_stats(prog.loc[prog.cohort_id.eq(cid)], p.loc[p.cohort_id.eq(cid)])))
-    table = pd.DataFrame(rows)
-    per_cohort = pd.DataFrame(details)
-    baseline = ratio(table.loc[table.lms_valid, "dropped"].sum(), table.loc[table.lms_valid, "n"].sum())
-    table["course_drop"] = baseline
-    table["local_anomaly"] = ""
-    if not per_cohort.empty:
-        for mod, group in per_cohort.groupby("module_no"):
-            valid = group.loc[group.lms_valid]
-            if len(valid) >= 3:
-                flags = valid.apply(lambda r: any(z in ("red", "yellow") for z in module_zones(r, np.nan).values()), axis=1)
-                if int(flags.sum()) == 1:
-                    culprit = valid.loc[flags, "cohort_id"].iloc[0]
-                    name = cohorts.set_index("cohort_id").loc[culprit, "cohort_name"]
-                    table.loc[table.module_no.eq(mod), "local_anomaly"] = str(name)
-    return table, per_cohort
-
-
-def module_zones(r, course_drop=np.nan):
-    lms, mhi = bool(r["lms_valid"]), bool(r["mhi_valid"])
-    drop = low_zone(r["drop"], .10, .15, lms)
-    if lms and not pd.isna(course_drop) and r["drop"] - course_drop >= .10 - 1e-10:
-        drop = "red"
-    return dict(drop=drop, lag=low_zone(r["lag"], .20, valid=lms),
-                loop=low_zone(r["loop"], .15, .20, lms),
-                rushed=low_zone(r["rushed"], .25, .30, mhi),
-                slow=low_zone(r["slow"], .20, valid=mhi),
-                fragmented=low_zone(r["fragmented"], .15, .20, mhi),
-                depleted=low_zone(r["depleted"], .25, .25, mhi))
-
-
-def module_insights(r):
-    """Возвращает все применимые гипотезы; несколько причин могут сосуществовать."""
-    if not r["lms_valid"]:
-        return [(0, "Предварительное наблюдение", [
-            "Накопить не менее 15 активных участников с закрытым окном cutoff. Системный диагноз пока не формируется."])]
-    insights = []
-    acute = r["drop"] > .15 or r["lag"] > .20
-    phase = "острая фаза" if acute else "скрытое напряжение"
-    valid = bool(r["mhi_valid"])
-    if r["loop"] > .15 or (valid and r["fragmented"] > .15):
-        insights.append((2, f"Разрыв сценария или сбой проверки · {phase}", [
-            "Проверить тренажёр и автотесты на корректность.",
-            "Сверить термины лекции и задания; добавить разобранный пример и стартовый шаблон."]))
-    if valid:
-        if r["rushed"] > .25 and r["fragmented"] <= .15:
-            insights.append((3, f"Перегрузка объёмом · {phase}", [
-                "Сопоставить плановый хронометраж с реальным временем прохождения.",
-                "Вынести второстепенную теорию в опциональный блок; сократить однотипную рутину ДЗ."]))
-        if r["depleted"] > .25 and r["fragmented"] <= .15:
-            insights.append((4, "Накопление усталости", [
-                "Проверить, не стоят ли несколько тяжёлых модулей подряд.",
-                "Оценить буферную неделю, консолидацию знаний или облегчение практики на экваторе."]))
-        normal = r["rushed"] <= .25 and r["fragmented"] <= .15 and r["depleted"] <= .25 and r["slow"] <= .20
-        if (r["drop"] > .10 or r["lag"] > .20) and normal and r["loop"] <= .15:
-            insights.append((5, "Барьер у не дошедших до опроса", [
-                "Найти шаг остановки: установка ПО, доступы, окружение или практическое задание.",
-                "Проверить комментарии В10 и сравнить петли ошибок у сдавших и остановившихся."]))
-        if r["slow"] > .20 and r["drop"] <= .15:
-            insights.append((6, "Обращение экспертизы · заниженный темп", [
-                "Предусмотреть досрочную сдачу базовых шагов и факультативные задачи со звёздочкой."]))
-        if not insights and normal and r["drop"] <= .10 and r["lag"] <= .20 and r["loop"] <= .15:
-            insights.append((1, "Штатный модуль", [
-                "Зафиксировать рабочую структуру; планировать точечные улучшения по комментариям."]))
-    else:
-        insights.append((7, "Данных опроса недостаточно", [
-            "Опираться на логи LMS. MHI отражает только студентов, завершивших практику и заполнивших анкету.",
-            "Проверить остановки до опроса и между сдачей практики и анкетой; не трактовать оценки оставшихся как норму всей группы."]))
-    if not insights:
-        insights.append((0, "Смешанный профиль", [
-            "Проверить отмеченные показатели и комментарии отдельно: сочетание не покрыто типовым сценарием."]))
-    return insights
-
-
-def role_metrics(data, cohorts, module_table):
-    ids = cohorts.cohort_id.tolist()
-    eligible_pairs = set()
-    completed = set(cohorts.loc[cohorts.assessment_deadline.le(AS_OF) & cohorts.reviews_closed, "cohort_id"])
-    for m in data["modules"].loc[data["modules"].cohort_id.isin(ids)].itertuples():
-        if m.cutoff_date <= AS_OF or m.cohort_id in completed:
-            eligible_pairs.add((m.cohort_id, m.module_no))
-    p = data["pulse"].loc[data["pulse"].cohort_id.isin(ids)].copy()
-    p = p.loc[[(r.cohort_id, r.module_no) in eligible_pairs for r in p.itertuples()]]
-    unique = p.student_id.nunique()
-    enrolled = len(data["students"].loc[data["students"].cohort_id.isin(ids)])
-    top_unique = p[list(QUESTIONS)].ge(4).groupby(p.student_id).mean().mean() if unique else pd.Series(dtype=float)
-    return dict(content=top_unique.reindex(["q4", "q5", "q6"]).mean(), expert=top_unique.get("q7", np.nan),
-                care=top_unique.reindex(["q8", "q9"]).mean(), unique=unique,
-                coverage=ratio(unique, enrolled)), p
-
-
-def friction_alerts(table):
-    result = {}
-    previous = None
-    for _, r in table.sort_values("module_no").iterrows():
-        if previous is not None and r["module_no"] == previous["module_no"] + 1 and r["mhi_valid"] and previous["mhi_valid"]:
-            for q in QUESTIONS:
-                delta = previous[f"{q}_top"] - r[f"{q}_top"]
-                if delta >= .15 - 1e-10:
-                    result[(int(r["module_no"]), q)] = delta
-        previous = r
-    return result
-
-
-def service_insights(r):
-    if not r["mhi_valid"]:
-        return []
-    zones = {q: csi_zone(r[f"{q}_top"], r[f"{q}_bottom"], q, True) for q in QUESTIONS}
-    items = []
-    if any(zones[q] == "red" for q in ("q4", "q5", "q6")):
-        items.append(("Контент и практика", "Методист и автор", [
-            "Сверить В10 с петлями ошибок и отсевом.",
-            "При просадке В6 проверить формулировки ДЗ и автотесты; при В4/В5 обновить подачу и актуальность примеров."]))
-    if zones["q7"] == "red":
-        items.append(("Подача эксперта", "Отдел работы с экспертами", [
-            "Сравнить разные потоки и записи занятий; проверить динамику и ответы на вопросы.",
-            "Провести развивающий брифинг. Одного сигнала недостаточно для кадрового решения."]))
-    if zones["q8"] == "red":
-        items.append(("Восприятие скорости", "Руководитель сопровождения", [
-            "Проверить фактическое время ответа и проверки в LMS: оценка В8 не измеряет SLA.",
-            "При задержках перераспределить нагрузку; при соблюдении SLA уточнить ожидания и видимость регламента."]))
-    if zones["q9"] == "red":
-        items.append(("Эмпатия и тон общения", "Руководитель сопровождения", [
-            "Изучить В10, тексты ревью и чаты; проверить ясность и тон обратной связи.",
-            "Откалибровать обратную связь: признание усилий и конкретный следующий шаг."]))
-    return items
-
-
-def validate_data(data):
-    """Проверки контрактов генератора и будущего адаптера LMS; возвращает ошибки."""
-    errors = []
-    c, m, s, p, q = (data[k] for k in ("cohorts", "modules", "students", "progress", "pulse"))
-    for name, frame, keys in [("cohorts", c, ["cohort_id"]), ("modules", m, ["cohort_id", "module_no"]),
-                              ("students", s, ["cohort_id", "student_id"]),
-                              ("progress", p, ["cohort_id", "student_id", "module_no"]),
-                              ("pulse", q, ["cohort_id", "student_id", "module_no"])]:
-        if frame.duplicated(keys).any():
-            errors.append(f"{name}: повторяются ключи {keys}")
-    if (s.final_passed & ~s.final_attempted).any():
-        errors.append("Passed_Task должен быть подмножеством Attempted_Task")
-    if not s.nps.dropna().between(0, 10).all():
-        errors.append("Оценка NPS должна быть от 0 до 10")
-    if not q[list(QUESTIONS)].isin([1, 2, 3, 4, 5]).all().all():
-        errors.append("В4–В9 должны содержать обязательные оценки 1–5")
-    join = q.merge(p, on=["cohort_id", "student_id", "module_no"], how="left", validate="one_to_one")
-    if not join.state.eq("passed").all():
-        errors.append("Анкета допустима только после успешной практики")
-    if not p.state.isin(["passed", "lagging", "paused", "dropped_official", "dropped_inactive"]).all():
-        errors.append("Неизвестный статус модуля")
-    known_students = set(zip(s.cohort_id, s.student_id))
-    if any((r.cohort_id, r.student_id) not in known_students for r in p.itertuples()):
-        errors.append("В progress есть неизвестные студенты")
-    known_modules = set(zip(m.cohort_id, m.module_no))
-    if any((r.cohort_id, r.module_no) not in known_modules for r in p.itertuples()):
-        errors.append("В progress есть неизвестные модули")
-    answered = set(zip(q.cohort_id, q.student_id, q.module_no))
-    for r in p.loc[p.module_no.gt(1)].itertuples():
-        if (r.cohort_id, r.student_id, r.module_no - 1) not in answered:
-            errors.append("Переход на следующий модуль без обязательного опроса")
-            break
-    finalists = set(zip(p.loc[p.module_no.eq(6), "cohort_id"], p.loc[p.module_no.eq(6), "student_id"]))
-    for r in s.loc[s.final_attempted | s.nps.notna()].itertuples():
-        if (r.cohort_id, r.student_id) not in finalists:
-            errors.append("Итоговая работа или NPS у нефиналиста")
-            break
-        if r.final_attempted and (r.cohort_id, r.student_id, 6) not in answered:
-            errors.append("Итоговая аттестация без опроса последнего модуля")
-            break
-    for sid in c.slice_id.unique():
-        try:
-            slice_cohorts(data, sid)
-        except ValueError as exc:
-            errors.append(str(exc))
-    return errors
-
-
-def dataset_zip(data, seed, cohort_size):
-    buffer = BytesIO()
-    with ZipFile(buffer, "w", ZIP_DEFLATED) as z:
-        for name, frame in data.items():
-            z.writestr(f"{name}.csv", frame.to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8-sig"))
-        z.writestr("metadata.json", json.dumps(dict(synthetic=True, seed=int(seed), cohort_size=int(cohort_size),
-                                                     as_of=str(AS_OF.date()), schema_version="1.0",
-                                                     note="progress.state: snapshot at cutoff; open windows are provisional"),
-                                                ensure_ascii=False, indent=2))
-    return buffer.getvalue()
-
-
-CSS = """
+st.markdown("""
 <style>
-.stApp {background:#F5F7FA; color:#192E44;}
-.block-container {max-width:1510px; padding-top:2rem; padding-bottom:3rem;}
-h1,h2,h3 {letter-spacing:-.025em; color:#17324D;}
-h1 {font-size:2.25rem !important; font-weight:750 !important;}
-.eyebrow {font-size:.72rem; letter-spacing:.16em; color:#668093; font-weight:750; margin-bottom:.4rem;}
-.subhead {color:#64768A; font-size:1rem; margin-top:-.4rem; margin-bottom:1.4rem;}
-.kpi {background:white; border:1px solid #E1E7EF; border-radius:14px; padding:18px 18px 15px; min-height:182px; box-shadow:0 3px 12px #1A354405;}
-.kpi-title {font-size:.82rem; color:#60748A; min-height:23px;}
-.kpi-number {font-size:2.1rem; color:#19354F; letter-spacing:-.04em; font-weight:750; line-height:1.35;}
-.kpi-detail {font-size:.76rem; color:#697B8F; min-height:34px; margin:3px 0 10px;}
-.pill {display:inline-block; font-size:.70rem; font-weight:650; border-radius:20px; padding:4px 9px;}
-.insight {border:1px solid #DDE7E4; background:white; border-left:4px solid #16816B; border-radius:12px; padding:18px 20px; margin:18px 0;}
-.insight-title {font-size:1.12rem; font-weight:700; margin-bottom:6px;}
-.insight-body {font-size:.9rem; color:#52697D; line-height:1.6;}
-.matrix-wrap {overflow-x:auto; border:1px solid #DFE6EE; border-radius:12px; background:white; margin:12px 0;}
-.matrix {width:100%; border-collapse:separate; border-spacing:0; font-size:.78rem;}
-.matrix th {background:#EDF2F7; color:#496176; padding:12px 9px; text-align:left; font-size:.72rem; font-weight:700; white-space:nowrap;}
-.matrix td {padding:11px 8px; border-top:1px solid #E9EDF3; vertical-align:middle;}
-.matrix td:first-child {min-width:170px; max-width:220px; font-weight:650; color:#28475F;}
-.matrix small {display:block; font-size:.67rem; font-weight:400; color:#6F8194; margin-top:4px;}
-.cell {display:block; border-radius:6px; padding:7px 8px; white-space:nowrap; font-weight:650;}
-.feedback {background:white; border:1px solid #E1E7EF; padding:13px 16px; border-radius:10px; margin:8px 0; color:#29445D; font-size:.9rem;}
-.feedback small {color:#718498; display:block; margin-bottom:5px;}
-div[data-testid="stMetric"] {background:white; border:1px solid #E1E7EF; border-radius:10px; padding:12px;}
-div[data-testid="stExpander"] {background:white; border-radius:10px;}
-button[data-baseweb="tab"] {font-size:.92rem;}
-@media (max-width:700px) {.block-container {padding-left:1rem; padding-right:1rem;} .kpi {min-height:150px;} h1 {font-size:1.8rem !important;}}
+.kpi-card {
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 12px;
+    border: 1px solid #e0e0e0;
+    background-color: #ffffff;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+.kpi-title { font-size: 0.9rem; color: #374151 !important; font-weight: 600; margin-bottom: 4px; }
+.kpi-value { font-size: 1.75rem; font-weight: 700; margin-bottom: 4px; color: #111827 !important; }
+.kpi-sub { font-size: 0.82rem; color: #4b5563 !important; margin-bottom: 8px; }
+.kpi-badge {
+    display: inline-block;
+    padding: 3px 8px;
+    border-radius: 6px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    background-color: rgba(255,255,255,0.75);
+    color: inherit !important;
+}
+.bg-green { background-color: #e6f4ea !important; color: #137333 !important; border-left: 5px solid #34a853 !important; }
+.bg-yellow { background-color: #fef7e0 !important; color: #b06000 !important; border-left: 5px solid #fbbc04 !important; }
+.bg-red { background-color: #fce8e6 !important; color: #c5221f !important; border-left: 5px solid #ea4335 !important; }
+.bg-grey { background-color: #f1f3f4 !important; color: #5f6368 !important; border-left: 5px solid #9aa0a6 !important; }
+
+.custom-table-wrap { overflow-x: auto; margin-bottom: 1rem; }
+table.custom-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    background-color: #ffffff !important;
+    color: #1f2937 !important;
+    border: 1px solid #d1d5db;
+}
+table.custom-table th {
+    background-color: #f3f4f6 !important;
+    color: #111827 !important;
+    font-weight: 600;
+    text-align: left;
+    padding: 10px 12px;
+    border-bottom: 2px solid #d1d5db;
+    border-right: 1px solid #e5e7eb;
+}
+table.custom-table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid #e5e7eb;
+    border-right: 1px solid #e5e7eb;
+    color: #1f2937;
+    vertical-align: middle;
+}
+.cell-red { background-color: #fce8e6 !important; color: #c5221f !important; font-weight: 600; }
+.cell-yellow { background-color: #fef7e0 !important; color: #b06000 !important; font-weight: 600; }
+.cell-green { background-color: #e6f4ea !important; color: #137333 !important; }
+.cell-grey { background-color: #f1f3f4 !important; color: #5f6368 !important; }
+.cell-norm { background-color: #ffffff !important; color: #1f2937 !important; }
 </style>
-"""
+""", unsafe_allow_html=True)
 
 
-def html_cell(text, zone, tooltip=""):
-    return (f'<span class="cell" style="background:{BG[zone]};color:{COLORS[zone]}" '
-            f'title="{escape(tooltip, quote=True)}">{escape(str(text))}</span>')
+# =====================================================================
+# ДАННЫЕ СРЕЗОВ (СИНТЕТИЧЕСКИЙ НАБОР ДЛЯ ПРОВЕРКИ ВСЕХ СЦЕНАРИЕВ ТЗ)
+# =====================================================================
+@st.cache_data
+def get_slices_data():
+    return {
+        "Срез 1 [Потоки 1–3, v1.0]": {
+            "id": "Срез 1 (v1.0)",
+            "version": "v1.0",
+            "enrolled": 45,
+            "finished": 31,
+            "attempted_task": 23,
+            "passed_task": 16,
+            "nps": 64,
+            "nps_respondents": 22,
+            "anomaly_cohort": None,
+            "u_resp": 38,
+            "top2_unique": {"q4": 81.5, "q5": 84.0, "q6": 71.0, "q7": 89.5, "q8": 78.0, "q9": 91.0},
+            "modules": [
+                {
+                    "num": 1, "name": "М1: Введение и архитектура",
+                    "started": 45, "paused": 1, "passed": 41, "lagging": 1,
+                    "dropped_official": 1, "dropped_inactive": 1,
+                    "mhi_resp": 40,
+                    "rushed_cnt": 5, "slow_cnt": 9, "frag_cnt": 3, "depl_cnt": 2,
+                    "loop_fail_users": 3, "cohort_outlier": False,
+                    "csi_top2": {"q4": 90.0, "q5": 92.5, "q6": 87.5, "q7": 92.5, "q8": 90.0, "q9": 95.0},
+                    "csi_bot2": {"q4": 2.5, "q5": 2.5, "q6": 5.0, "q7": 2.5, "q8": 5.0, "q9": 0.0},
+                    "comments": [
+                        "Для продолжающих специалистов первые уроки показались слишком простыми, хотелось бы сдать экстерном."
+                    ]
+                },
+                {
+                    "num": 2, "name": "М2: Проектирование БД и SQL",
+                    "started": 42, "paused": 2, "passed": 31, "lagging": 2,
+                    "dropped_official": 3, "dropped_inactive": 4,
+                    "mhi_resp": 30,
+                    "rushed_cnt": 7, "slow_cnt": 2, "frag_cnt": 8, "depl_cnt": 5,
+                    "loop_fail_users": 10, "cohort_outlier": False,
+                    "csi_top2": {"q4": 76.7, "q5": 83.3, "q6": 66.7, "q7": 90.0, "q8": 83.3, "q9": 90.0},
+                    "csi_bot2": {"q4": 10.0, "q5": 6.7, "q6": 20.0, "q7": 3.3, "q8": 6.7, "q9": 3.3},
+                    "comments": [
+                        "В домашнем задании используются конструкции JOIN и оконные функции, которых не было в лекции!",
+                        "Автотест в тренажере на 3-м шаге падает без понятного описания ошибки, просидел два вечера."
+                    ]
+                },
+                {
+                    "num": 3, "name": "М3: Асинхронность и интеграция API",
+                    "started": 33, "paused": 0, "passed": 26, "lagging": 3,
+                    "dropped_official": 1, "dropped_inactive": 3,
+                    "mhi_resp": 25,
+                    "rushed_cnt": 9, "slow_cnt": 1, "frag_cnt": 3, "depl_cnt": 6,
+                    "loop_fail_users": 4, "cohort_outlier": True,
+                    "csi_top2": {"q4": 80.0, "q5": 84.0, "q6": 76.0, "q7": 88.0, "q8": 72.0, "q9": 88.0},
+                    "csi_bot2": {"q4": 8.0, "q5": 4.0, "q6": 12.0, "q7": 4.0, "q8": 16.0, "q9": 4.0},
+                    "comments": [
+                        "Очень большой объем видео (почти 5 часов) и рутинной верстки шаблонов, физически не успеваю после работы.",
+                        "Проверку ДЗ ждал почти трое суток, хотя куратор ответил очень вежливо и подробно."
+                    ]
+                },
+                {
+                    "num": 4, "name": "М4: Деплой и подготовка к диплому",
+                    "started": 31, "paused": 0, "passed": 28, "lagging": 1,
+                    "dropped_official": 1, "dropped_inactive": 1,
+                    "mhi_resp": 27,
+                    "rushed_cnt": 6, "slow_cnt": 1, "frag_cnt": 3, "depl_cnt": 8,
+                    "loop_fail_users": 3, "cohort_outlier": False,
+                    "csi_top2": {"q4": 85.2, "q5": 88.9, "q6": 81.5, "q7": 88.9, "q8": 85.2, "q9": 92.6},
+                    "csi_bot2": {"q4": 3.7, "q5": 3.7, "q6": 7.4, "q7": 3.7, "q8": 7.4, "q9": 3.7},
+                    "comments": [
+                        "К четвертому модулю накопилась сильная усталость, перед защитой диплома не хватает буферной недели."
+                    ]
+                },
+            ]
+        },
+        "Срез 2 [Потоки 4–6, v1.1]": {
+            "id": "Срез 2 (v1.1)",
+            "version": "v1.1",
+            "enrolled": 48,
+            "finished": 33,
+            "attempted_task": 29,
+            "passed_task": 23,
+            "nps": 48,
+            "nps_respondents": 24,
+            "anomaly_cohort": "Потока #5",
+            "u_resp": 42,
+            "top2_unique": {"q4": 86.0, "q5": 88.0, "q6": 82.0, "q7": 84.5, "q8": 88.5, "q9": 90.0},
+            "modules": [
+                {
+                    "num": 1, "name": "М1: Введение и архитектура",
+                    "started": 48, "paused": 1, "passed": 44, "lagging": 1,
+                    "dropped_official": 1, "dropped_inactive": 1,
+                    "mhi_resp": 43,
+                    "rushed_cnt": 5, "slow_cnt": 5, "frag_cnt": 3, "depl_cnt": 3,
+                    "loop_fail_users": 3, "cohort_outlier": False,
+                    "csi_top2": {"q4": 90.7, "q5": 93.0, "q6": 88.4, "q7": 93.0, "q8": 90.7, "q9": 93.0},
+                    "csi_bot2": {"q4": 2.3, "q5": 2.3, "q6": 4.7, "q7": 2.3, "q8": 4.7, "q9": 2.3},
+                    "comments": []
+                },
+                {
+                    "num": 2, "name": "М2: Проектирование БД и SQL",
+                    "started": 45, "paused": 1, "passed": 38, "lagging": 2,
+                    "dropped_official": 2, "dropped_inactive": 2,
+                    "mhi_resp": 37,
+                    "rushed_cnt": 6, "slow_cnt": 2, "frag_cnt": 4, "depl_cnt": 4,
+                    "loop_fail_users": 5, "cohort_outlier": False,
+                    "csi_top2": {"q4": 86.5, "q5": 89.2, "q6": 83.8, "q7": 75.7, "q8": 89.2, "q9": 89.2},
+                    "csi_bot2": {"q4": 5.4, "q5": 2.7, "q6": 8.1, "q7": 16.2, "q8": 5.4, "q9": 5.4},
+                    "comments": [
+                        "Новый шаблон к ДЗ по SQL сильно помог, но приглашенный спикер на вебинаре в Потоке 5 путался в примерах."
+                    ]
+                },
+                {
+                    "num": 3, "name": "М3: Асинхронность и интеграция API",
+                    "started": 40, "paused": 1, "passed": 33, "lagging": 2,
+                    "dropped_official": 2, "dropped_inactive": 2,
+                    "mhi_resp": 32,
+                    "rushed_cnt": 9, "slow_cnt": 1, "frag_cnt": 3, "depl_cnt": 5,
+                    "loop_fail_users": 4, "cohort_outlier": False,
+                    "csi_top2": {"q4": 84.4, "q5": 87.5, "q6": 81.3, "q7": 87.5, "q8": 87.5, "q9": 90.6},
+                    "csi_bot2": {"q4": 6.3, "q5": 3.1, "q6": 9.4, "q7": 6.3, "q8": 6.3, "q9": 3.1},
+                    "comments": [
+                        "Материала всё ещё многовато для одной недели, приходилось сидеть в выходные."
+                    ]
+                },
+                {
+                    "num": 4, "name": "М4: Деплой и подготовка к диплому",
+                    "started": 35, "paused": 0, "passed": 29, "lagging": 1,
+                    "dropped_official": 2, "dropped_inactive": 3,
+                    "mhi_resp": 14,
+                    "rushed_cnt": 3, "slow_cnt": 1, "frag_cnt": 2, "depl_cnt": 3,
+                    "loop_fail_users": 3, "cohort_outlier": False,
+                    "csi_top2": {"q4": 85.7, "q5": 85.7, "q6": 78.6, "q7": 85.7, "q8": 85.7, "q9": 92.9},
+                    "csi_bot2": {"q4": 7.1, "q5": 7.1, "q6": 7.1, "q7": 7.1, "q8": 7.1, "q9": 0.0},
+                    "comments": []
+                },
+            ]
+        },
+        "Срез 3 [Потоки 7–9, v1.2]": {
+            "id": "Срез 3 (v1.2)",
+            "version": "v1.2",
+            "enrolled": 52,
+            "finished": 38,
+            "attempted_task": 35,
+            "passed_task": 31,
+            "nps": 58,
+            "nps_respondents": 28,
+            "anomaly_cohort": None,
+            "u_resp": 46,
+            "top2_unique": {"q4": 89.2, "q5": 91.0, "q6": 87.5, "q7": 91.5, "q8": 92.0, "q9": 94.0},
+            "modules": [
+                {
+                    "num": 1, "name": "М1: Введение и архитектура",
+                    "started": 52, "paused": 1, "passed": 48, "lagging": 1,
+                    "dropped_official": 1, "dropped_inactive": 1,
+                    "mhi_resp": 47,
+                    "rushed_cnt": 5, "slow_cnt": 4, "frag_cnt": 3, "depl_cnt": 3,
+                    "loop_fail_users": 3, "cohort_outlier": False,
+                    "csi_top2": {"q4": 91.5, "q5": 93.6, "q6": 89.4, "q7": 93.6, "q8": 91.5, "q9": 95.7},
+                    "csi_bot2": {"q4": 2.1, "q5": 2.1, "q6": 4.3, "q7": 2.1, "q8": 4.3, "q9": 0.0},
+                    "comments": ["Отличный старт, трек экстерната для опытных сэкономил кучу времени!"]
+                },
+                {
+                    "num": 2, "name": "М2: Проектирование БД и SQL",
+                    "started": 49, "paused": 1, "passed": 43, "lagging": 2,
+                    "dropped_official": 1, "dropped_inactive": 2,
+                    "mhi_resp": 42,
+                    "rushed_cnt": 7, "slow_cnt": 3, "frag_cnt": 4, "depl_cnt": 4,
+                    "loop_fail_users": 4, "cohort_outlier": False,
+                    "csi_top2": {"q4": 88.1, "q5": 90.5, "q6": 88.1, "q7": 90.5, "q8": 92.9, "q9": 92.9},
+                    "csi_bot2": {"q4": 4.8, "q5": 2.4, "q6": 4.8, "q7": 4.8, "q8": 2.4, "q9": 2.4},
+                    "comments": ["Разбор типового кейса перед ДЗ снял все вопросы по сложным запросам."]
+                },
+                {
+                    "num": 3, "name": "М3: Асинхронность и интеграция API",
+                    "started": 45, "paused": 1, "passed": 40, "lagging": 1,
+                    "dropped_official": 1, "dropped_inactive": 2,
+                    "mhi_resp": 39,
+                    "rushed_cnt": 7, "slow_cnt": 2, "frag_cnt": 3, "depl_cnt": 5,
+                    "loop_fail_users": 4, "cohort_outlier": False,
+                    "csi_top2": {"q4": 89.7, "q5": 89.7, "q6": 87.2, "q7": 89.7, "q8": 92.3, "q9": 94.9},
+                    "csi_bot2": {"q4": 2.6, "q5": 2.6, "q6": 5.1, "q7": 5.1, "q8": 2.6, "q9": 2.6},
+                    "comments": []
+                },
+                {
+                    "num": 4, "name": "М4: Деплой и подготовка к диплому",
+                    "started": 40, "paused": 0, "passed": 38, "lagging": 0,
+                    "dropped_official": 1, "dropped_inactive": 1,
+                    "mhi_resp": 37,
+                    "rushed_cnt": 6, "slow_cnt": 2, "frag_cnt": 3, "depl_cnt": 5,
+                    "loop_fail_users": 3, "cohort_outlier": False,
+                    "csi_top2": {"q4": 89.2, "q5": 91.9, "q6": 86.5, "q7": 91.9, "q8": 91.9, "q9": 94.6},
+                    "csi_bot2": {"q4": 2.7, "q5": 2.7, "q6": 5.4, "q7": 2.7, "q8": 2.7, "q9": 0.0},
+                    "comments": ["Все структурно и прозрачно, рубрикатор дипломного проекта понятен заранее."]
+                },
+            ]
+        },
+        "Срез 4 [Поток 10, v1.2 — в наборе]": {
+            "id": "Срез 4 (набор)",
+            "version": "v1.2",
+            "enrolled": 18,
+            "finished": 14,
+            "attempted_task": 12,
+            "passed_task": 11,
+            "nps": 60,
+            "nps_respondents": 10,
+            "anomaly_cohort": None,
+            "u_resp": 15,
+            "top2_unique": {"q4": 88.0, "q5": 90.0, "q6": 86.0, "q7": 90.0, "q8": 90.0, "q9": 92.0},
+            "modules": []
+        }
+    }
 
 
-def html_table(headers, rows):
-    head = "".join(f"<th>{escape(h)}</th>" for h in headers)
-    body = "".join("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>" for row in rows)
-    st.markdown(f'<div class="matrix-wrap"><table class="matrix"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>', unsafe_allow_html=True)
+slices_data = get_slices_data()
 
 
-def kpi(title, value, detail, zone, label=None):
-    st.markdown(f'<div class="kpi"><div class="kpi-title">{escape(title)}</div>'
-                f'<div class="kpi-number">{escape(value)}</div><div class="kpi-detail">{escape(detail)}</div>'
-                f'<span class="pill" style="background:{BG[zone]};color:{COLORS[zone]}">{escape(label or ZONES[zone])}</span></div>',
-                unsafe_allow_html=True)
+# =====================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ОДНОСТРОЧНЫЙ HTML БЕЗ ОТСТУПОВ)
+# =====================================================================
+def render_kpi_card(title, value_str, subtitle, status_label, color_class, extra_badge=""):
+    badge_html = f'<div style="margin-top:6px;"><span class="kpi-badge">{extra_badge}</span></div>' if extra_badge else ""
+    card_html = (
+        f'<div class="kpi-card {color_class}">'
+        f'<div class="kpi-title">{title}</div>'
+        f'<div class="kpi-value">{value_str}</div>'
+        f'<div class="kpi-sub">{subtitle}</div>'
+        f'<span class="kpi-badge">{status_label}</span>'
+        f'{badge_html}'
+        f'</div>'
+    )
+    st.markdown(card_html, unsafe_allow_html=True)
 
 
-def note(title, body, zone="green"):
-    st.markdown(f'<div class="insight" style="border-left-color:{COLORS[zone]}">'
-                f'<div class="insight-title">{escape(title)}</div><div class="insight-body">{escape(body)}</div></div>',
-                unsafe_allow_html=True)
+def evaluate_macro_scenario(hi_core, cr_pct, a_task_pct, nps_val, nps_valid, no_show_pct, rubric_fail_pct, unconfirmed_pct):
+    """Формирование автоматической исследовательской записки (чистый Markdown для st.container)"""
+    task_fail_pct = 100.0 - a_task_pct
+
+    nps_fact = (
+        f"Индекс лояльности выпускников **NPS = {nps_val:+d}**."
+        if nps_valid else
+        "Индекс лояльности **NPS: ⚪ Данных недостаточно** (менее 15 ответов или охват < 50%)."
+    )
+    facts_base = (
+        f"* **Сквозной выход навыка (HI_core):** `{hi_core:.3f}` ({hi_core*100:.1f}% от поступивших)\n"
+        f"* **Доходимость до финала (CR):** `{cr_pct:.1f}%`\n"
+        f"* **Сдача боевой задачи (A_task):** `{a_task_pct:.1f}%`\n"
+        f"* **Потери на финише (Task_Fail_Rate):** `{task_fail_pct:.1f}%` финалистов без подтвержденного результата "
+        f"(не приступили к проекту `No_Show_Rate`: `{no_show_pct:.1f}%` | не прошли по рубрикатору `Rubric_Fail_Rate`: `{rubric_fail_pct:.1f}%`)\n"
+        f"* **Доля «холостого выпуска» (Unconfirmed_Share):** `{unconfirmed_pct:.1f}%` от всех зачисленных\n"
+        f"* {nps_fact}"
+    )
+
+    if nps_valid:
+        if hi_core >= 0.500 and cr_pct >= 65.0 and a_task_pct >= 75.0 and nps_val >= 50:
+            col1 = (
+                "**Сценарий 1. Сбалансированный бенчмарк**\n\n"
+                "🟢 **Здоровый продукт:** высокий сквозной выход подтвержденных специалистов, "
+                "удержание и удовлетворенность в целевой зоне.\n\n" + facts_base
+            )
+            col2 = (
+                "**Действия:**\n\n"
+                "1. Зафиксировать текущую версию программы как базовый эталон.\n"
+                "2. Развивать трек задач повышенной сложности для сильных студентов."
+            )
+            return col1, col2
+
+        if cr_pct >= 65.0 and a_task_pct < 60.0 and (35 <= nps_val <= 60):
+            col1 = (
+                "**Сценарий 2. «Иллюзия доходимости» (при умеренной лояльности)**\n\n"
+                "🟡 **Разрыв подтверждения навыка:** студенты успешно проходят модули, но более 40% финалистов "
+                "не имеют подтвержденного результата по итоговому кейсу (требуется разделить неучастие в защите и несдачу по критериям).\n\n"
+                + facts_base
+            )
+            col2 = (
+                "**Что проверить:**\n\n"
+                "1. Соотношение `No_Show_Rate` и `Rubric_Fail_Rate`: люди не приступают к диплому из-за усталости или не проходят по баллам.\n"
+                "2. Нет ли избыточных подсказок кураторов в промежуточных ДЗ («ведение за руку»).\n"
+                "3. Соответствует ли сложность диплома предыдущим модулям."
+            )
+            return col1, col2
+
+        if cr_pct >= 65.0 and a_task_pct < 60.0 and nps_val > 60:
+            col1 = (
+                "**Сценарий 3. «Эмоциональная ловушка» (Забота вместо навыка)**\n\n"
+                "🟡 **Атмосфера без подтверждения результата:** студенты восторженно оценивают спикеров и комьюнити, "
+                "но более 40% финалистов выпускаются без защищенного проекта.\n\n"
+                + facts_base
+            )
+            col2 = (
+                "**Что проверить:**\n\n"
+                "1. Не носит ли приемка промежуточных заданий завышенно-лояльный характер («зачет за старание»).\n"
+                "2. Калибровку критериев проверки между текущими кураторами и независимыми ревьюерами диплома."
+            )
+            return col1, col2
+
+        if cr_pct >= 55.0 and a_task_pct < 60.0 and nps_val < 35:
+            col1 = (
+                "**Сценарий 4. «Кризис результата и ожиданий»**\n\n"
+                "🔴 **Критический дефицит результата на финише:** студенты дошли до конца курса, но не подтвердили "
+                "квалификацию на боевой задаче и разочарованы обучением.\n\n"
+                + facts_base
+            )
+            col2 = (
+                "**Что проверить (Приоритет P1):**\n\n"
+                "1. На каком модуле возник разрыв между теорией и практикой (сверить с вкладкой «Аудит модулей»).\n"
+                "2. Прозрачность и адекватность требований итогового проекта.\n"
+                "3. Организовать поддерживающий практикум для финалистов текущего среза."
+            )
+            return col1, col2
+
+        if cr_pct < 55.0 and a_task_pct >= 75.0 and nps_val < 50:
+            col1 = (
+                "**Сценарий 5. «Синдром жесткого фильтра» (Буткемп)**\n\n"
+                "🟡 **Барьер доступности среды:** выжившие финалисты показывают высокий результат, но курс теряет "
+                "почти половину потока по дороге.\n\n" + facts_base
+            )
+            col2 = (
+                "**Что проверить:**\n\n"
+                "1. Наличие «модуля-убийцы» с резким скачком `Drop_rate` и `% Rushed` на вкладке «Аудит модулей»."
+            )
+            return col1, col2
+
+        if hi_core < 0.300 and cr_pct < 55.0 and a_task_pct < 60.0 and nps_val < 35:
+            col1 = (
+                "**Сценарий 6. Системный кризис программы**\n\n"
+                "🔴 **Критический сбой курса:** высокие потери контингента на дистанции в сочетании с низкой сдачей проекта и негативом.\n\n"
+                + facts_base
+            )
+            col2 = (
+                "**Действия (Приоритет P0):**\n\n"
+                "1. Остановить масштабирование трафика на программу.\n"
+                "2. Провести сквозную ревизию соответствия программы профилю аудитории и пересобрать проблемные модули."
+            )
+            return col1, col2
+
+    cr_zone = "🟢 Высокий" if cr_pct >= 65.0 else ("🟡 Умеренный" if cr_pct >= 55.0 else "🔴 Низкий")
+    at_zone = "🟢 Высокий" if a_task_pct >= 75.0 else ("🟡 Умеренный" if a_task_pct >= 60.0 else "🔴 Низкий")
+    nps_zone = (
+        ("🟢 Высокий" if nps_val >= 50 else ("🟡 Умеренный" if nps_val >= 35 else "🔴 Низкий"))
+        if nps_valid else "⚪ Данных недостаточно"
+    )
+
+    col1 = (
+        "**Покомпонентный режим диагностики (Fallback)**\n\n"
+        f"Сочетание показателей находится в промежуточной зоне (или данных NPS недостаточно).\n"
+        f"Статус векторов: Удержание — **{cr_zone}**, Результат — **{at_zone}**, Лояльность — **{nps_zone}**.\n\n"
+        + facts_base
+    )
+
+    checks = []
+    if cr_pct < 65.0:
+        checks.append(
+            "* **По вектору удержания (CR в желтой/красной зоне):** проверить модули с повышенным `Drop_rate` и `Lagging_rate` на вкладке «Аудит модулей»."
+        )
+    if a_task_pct < 75.0:
+        checks.append(
+            f"* **По вектору результата (A_task в желтой/красной зоне):** проанализировать структуру `Task_Fail_Rate` ({task_fail_pct:.1f}%): "
+            f"долю не приступивших к проекту (`{no_show_pct:.1f}%`) и не преодолевших рубрикатор (`{rubric_fail_pct:.1f}%`). "
+            "Проверить плавность нарастания сложности практики к финалу."
+        )
+    if nps_valid and nps_val < 50:
+        checks.append(
+            "* **По вектору лояльности (NPS в желтой/красной зоне):** сверить динамику удовлетворенности контентом, спикерами и заботой на вкладке «Сервис и среда (CSI)»."
+        )
+    if not nps_valid:
+        checks.append(
+            "* **По охвату финального опроса (NPS):** повысить конверсию заполнения выпускной анкеты финалистами (требуется ≥ 15 ответов и охват ≥ 50%)."
+        )
+    if not checks:
+        checks.append("* Все ключевые показатели находятся в целевом коридоре.")
+
+    col2 = "**Чек-лист проверки по зонам внимания:**\n\n" + "\n".join(checks)
+    return col1, col2
 
 
-def chart_layout(fig, height=300):
-    fig.update_layout(template="plotly_white", height=height, margin=dict(l=20, r=20, t=25, b=30),
-                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                      font=dict(family="Arial, sans-serif", color="#486076", size=12),
-                      legend=dict(orientation="h", y=1.15, x=0), hoverlabel=dict(bgcolor="white"))
-    return fig
+def diagnose_module_lxd(mod_metrics, avg_course_drop):
+    drop = mod_metrics["drop_rate"]
+    lag = mod_metrics["lagging_rate"]
+    loop = mod_metrics["loop_fail"]
+    mhi_valid = mod_metrics["mhi_valid"]
+    rushed = mod_metrics["rushed"]
+    slow = mod_metrics["slow"]
+    frag = mod_metrics["frag"]
+    depl = mod_metrics["depl"]
 
+    lms_red = (drop > 15.0) or (drop - avg_course_drop > 10.0) or (loop > 20.0)
+    lms_yellow = (10.0 < drop <= 15.0) or (lag > 20.0) or (15.0 < loop <= 20.0)
 
-def fallback_actions(m):
-    actions = []
-    if m["cr"] < .65:
-        actions.append("Проверить модули с потерями и задолженностью; сопоставить их со входными требованиями курса.")
-    if m["a_task"] < .75:
-        actions.append("Разделить неучастие в защите и несдачу по критериям; проверить переход от учебных ДЗ к итоговому кейсу.")
-    if not m["nps_valid"]:
-        actions.append("Накопить минимум 15 ответов NPS при охвате не ниже 50% финалистов.")
-    elif m["nps"] < 50:
-        actions.append("Проверить ожидания студентов, сервисные оценки и открытые комментарии.")
-    if not actions:
-        actions.append("Продолжить наблюдение за показателями; сочетание не соответствует ни одному из шести типовых сценариев.")
-    return actions
+    mhi_red = mhi_valid and ((rushed > 30.0) or (frag > 20.0) or (depl > 25.0))
+    mhi_yellow = mhi_valid and ((25.0 < rushed <= 30.0) or (15.0 < frag <= 20.0) or (slow > 20.0))
 
+    is_red = lms_red or mhi_red
+    is_yellow = (not is_red) and (lms_yellow or mhi_yellow)
+    expanded = is_red or is_yellow
 
-def render_course(data, cohorts):
-    eligible = ready_cohorts(cohorts)
-    excluded = cohorts.loc[~cohorts.cohort_id.isin(eligible.cohort_id)]
-    if not excluded.empty:
-        st.info("В итоговом аудите участвуют только последовательные закрытые потоки: " +
-                (", ".join(eligible.cohort_name) if len(eligible) else "пока нет") +
-                ". Исключены: " + ", ".join(excluded.cohort_name) +
-                ". Причина: срок аттестации / незакрытая проверка или разрыв последовательности.")
-    m = course_metrics(data, eligible.cohort_id.tolist())
-    if m["enrolled"] < 30:
-        st.info(f"Идёт накопление выборки (собрано {m['enrolled']} из 30). Стратегическая аналитика курса защищена от шума малых групп.")
-        st.caption("Аудит модулей и сервисные оценки используют собственные пороги достаточности данных.")
-        return
-    cols = st.columns(4)
-    with cols[0]:
-        kpi("Сквозной HI_core", f"{m['hi']:.3f}", f"{m['passed']} из {m['enrolled']} зачисленных подтвердили навык", high_zone(m["hi"], .50, .30))
-    with cols[1]:
-        kpi("Доходимость · CR", pct(m["cr"]), f"{m['finished']} из {m['enrolled']} дошли до финала", high_zone(m["cr"], .65, .55))
-    with cols[2]:
-        kpi("Самостоятельная сдача · A_task", pct(m["a_task"]),
-            f"{m['passed']} из {m['finished']} финалистов · приступили {m['attempted']}",
-            high_zone(m["a_task"], .75, .60), "Предварительно: <20 финалистов" if m["finished"] < 20 else None)
-    with cols[3]:
-        kpi("Лояльность · NPS", "—" if pd.isna(m["nps"]) else f"{m['nps']:+.0f}",
-            f"Ответили {m['nps_n']} из {m['finished']} · охват {pct(m['nps_rr'], 0)}",
-            high_zone(m["nps"], 50, 35, m["nps_valid"]))
-    scenario = macro_scenario(m)
-    if scenario:
-        title, zone, priority, actions = MACRO[scenario]
-        note(f"{priority} · {title}", "Предварительная диагностика по сочетанию метрик. Причины требуют проверки по модулям, логам и комментариям.", zone)
+    scenarios = []
+
+    if not mhi_valid:
+        scenarios.append({
+            "title": "Сценарий №7. ⚪ Данных опроса недостаточно",
+            "hypothesis": "Высокий риск смещения оценок из-за малой выборки (m < 15) или остановки более половины группы до опроса (Response Rate < 50%).",
+            "checklist": [
+                "Опираться только на объективные логи LMS (`Drop_rate`, `Lagging_rate`, `% Loop Fail`) по алгоритму Сценария №5.",
+                "Проверить конверсию доходимости до финального опроса модуля."
+            ]
+        })
+
+    if (mhi_valid and frag > 15.0) or (loop > 15.0):
+        phase = "Острая фаза (с ростом отсева/отставания)" if (drop > 15.0 or lag > 20.0) else "Скрытая фаза (преодоление тупика ценой сверхусилий)"
+        sev = "🔴" if ((mhi_valid and frag > 20.0) or loop > 20.0) else "🟡"
+        scenarios.append({
+            "title": f"Сценарий №2. {sev} Гипотеза разрыва сценария или сбоя проверки ({phase})",
+            "hypothesis": "Вероятен отрыв практики от лекции, нехватка опорных примеров либо ошибка в автотестах.",
+            "checklist": [
+                "1. Проверить корректность работы тренажера и автотестов на задании.",
+                "2. Сверить терминологию лекции с формулировкой ТЗ домашнего задания.",
+                "3. Проверить наличие разобранного примера (worked example) и стартового шаблона (scaffolding)."
+            ]
+        })
+
+    if mhi_valid and rushed > 25.0 and frag <= 15.0:
+        phase = "Острая фаза" if (drop > 15.0 or lag > 20.0) else "Скрытая фаза (группа укладывается на пределе ресурса)"
+        sev = "🔴" if rushed > 30.0 else "🟡"
+        scenarios.append({
+            "title": f"Сценарий №3. {sev} Гипотеза перегруза объемом — CLT ({phase})",
+            "hypothesis": "Материал понятен, но суммарный хронометраж или объем рутины превышает недельный бюджет времени студента.",
+            "checklist": [
+                "1. Сопоставить расчетное время изучения видео/текстов и ДЗ с реальным временем прохождения в LMS.",
+                "2. Проверить, можно ли вынести второстепенную теорию в опциональные материалы.",
+                "3. Сократить однотипные механические операции в ДЗ."
+            ]
+        })
+
+    if mhi_valid and depl > 25.0 and frag <= 15.0:
+        scenarios.append({
+            "title": "Сценарий №4. 🔴 Гипотеза аккумуляции усталости",
+            "hypothesis": "Длительная высокая плотность сложных тем без передышки истощает ресурс учащихся.",
+            "checklist": [
+                "1. Проанализировать кривую плотности тем по всей программе: идут ли подряд несколько тяжелых модулей.",
+                "2. Оценить целесообразность буферной недели / модуля консолидации знаний или облегчения практики на экваторе."
+            ]
+        })
+
+    if (drop > 10.0 or lag > 20.0) and loop <= 15.0 and (not mhi_valid or (rushed <= 25.0 and frag <= 15.0 and depl <= 25.0)):
+        sev = "🔴" if drop > 15.0 else "🟡"
+        scenarios.append({
+            "title": f"Сценарий №5. {sev} Гипотеза барьера у не дошедших до финального опроса модуля",
+            "hypothesis": "Инфраструктурное трение ИЛИ скрытый методический стоппер: поскольку MHI отражает только опыт сдавших практику, нормальные оценки выживших не исключают барьера у остановившихся.",
+            "checklist": [
+                "1. По логам LMS локализовать шаг остановки неответивших в MHI: отвал произошел на входе в модуль (установка ПО, доступы, окружение) или на попытках выполнения практического задания.",
+                "2. Проверить текстовые комментарии В10 на жалобы по настройке софта и тренажера.",
+                "3. Сопоставить `% Loop Fail` между завершившими модуль и остановившимися студентами."
+            ]
+        })
+
+    if mhi_valid and slow > 20.0:
+        scenarios.append({
+            "title": "Сценарий №6. 🟡 Гипотеза обращения экспертизы (Скука)",
+            "hypothesis": "Базовый темп слишком прост для части аудитории с опытом.",
+            "checklist": [
+                "1. Добавить возможность досрочной сдачи базовых шагов (экстернат) и факультативные задачи «со звездочкой»."
+            ]
+        })
+
+    if not expanded and mhi_valid:
+        scenarios.append({
+            "title": "Сценарий №1. 🟢 Штатный модуль",
+            "hypothesis": "Признаков системного перегруза или когнитивных тупиков не выявлено.",
+            "checklist": [
+                "• Зафиксировать структуру урока как рабочую.",
+                "• Плановые точечные улучшения по открытым комментариям."
+            ]
+        })
+
+    if is_red:
+        badge = "🔴 Проблемный модуль (Красная зона)"
+    elif is_yellow:
+        badge = "🟡 Зона внимания (Желтая зона)"
     else:
-        actions = fallback_actions(m)
-        note("Покомпонентная оценка", "Сочетание не входит в типовую матрицу или NPS пока недостаточно надёжен. Ниже — факты и проверки по доступным показателям.", "gray")
-    if m["finished"] < 20:
-        st.warning("Малая база финалистов: A_task и зависящие от него гипотезы предварительны, даже при достаточной базе зачисленных.")
-    comp = cohort_comparison(data, eligible)
-    flags = isolated_course_anomalies(comp)
-    if flags:
-        st.warning("⚡ Локальная аномалия: " + "; ".join(f"{name} · {metric.upper()}" for name, metric in flags) +
-                   ". Сначала проверьте организацию этого потока и его состав.")
-    elif len(comp) == 2 and (comp.cr.max() - comp.cr.min() > .20 or comp.a_task.max() - comp.a_task.min() > .20):
-        st.warning("Между двумя потоками есть расхождение >20 п.п.; определить локальный выброс пока нельзя.")
-    left, right = st.columns([1, 1], gap="large")
-    with left:
-        st.subheader("Что показывают данные")
-        st.write(f"Подтверждённый результат есть у **{pct(m['hi'])}** зачисленных. "
-                 f"Среди финалистов без подтверждения — **{pct(m['task_fail'])}**: "
-                 f"не представили проект {pct(m['no_show'])}, не прошли рубрикатор {pct(m['rubric_fail'])}.")
-        st.write(f"Доля дошедших без подтверждённого навыка от всех зачисленных: **{pct(m['unconfirmed'])}**.")
-        st.caption("NPS отражает ответы финалистов, а не мнение всех зачисленных. Достаточный охват не устраняет смещение отбора.")
-    with right:
-        st.subheader("Гипотезы и действия")
-        for action in actions:
-            st.markdown(f"- {action}")
-    st.divider()
-    st.subheader("Воронка подтверждения навыка")
-    task_zone = high_zone(m["a_task"], .75, .60)
-    fig = go.Figure(go.Bar(x=[m["cr"], m["hi"]], y=["Дошли до финала", "Подтвердили навык"], orientation="h",
-                           marker_color=["#658FB7", COLORS[task_zone]], text=[pct(m["cr"]), pct(m["hi"])], textposition="auto",
-                           hovertemplate="%{y}: %{x:.1%} от зачисленных<extra></extra>"))
-    fig.update_xaxes(range=[0, 1], tickformat=".0%", gridcolor="#E3E9F0")
-    fig.update_yaxes(autorange="reversed")
-    st.plotly_chart(chart_layout(fig, 220), width="stretch", key="course_funnel")
-    if m["hi"] >= .50 and m["cr"] >= .65 and m["a_task"] >= .75:
-        st.success("Образовательный выход сбалансирован: высокая доходимость подкреплена самостоятельной защитой проекта.")
-    elif m["cr"] >= .65 and m["a_task"] < .60:
-        st.warning(f"Разрыв подтверждения результата: дошли {pct(m['cr'])}, подтвердили навык {pct(m['hi'])} от поступивших. "
-                   f"У {pct(m['task_fail'])} финалистов результат не подтверждён.")
-    elif m["cr"] < .55 and m["a_task"] >= .75:
-        st.info(f"Жёсткий фильтр: сдача {pct(m['a_task'])} среди финалистов при потере {pct(1 - m['cr'])} зачисленных до финала.")
-    else:
-        st.info(f"Удержание: {ZONES[high_zone(m['cr'], .65, .55)].lower()}. Подтверждение результата: "
-                f"{ZONES[task_zone].lower()}. Не приступили {pct(m['no_show'])}; не прошли критерии {pct(m['rubric_fail'])} финалистов.")
-    st.subheader("Динамика срезов одной версии")
-    all_c = data["cohorts"]
-    same = all_c.loc[all_c.course.eq(cohorts.iloc[0].course) & all_c.version.eq(cohorts.iloc[0].version)]
-    history = []
-    for sid in same.sort_values("start_date").slice_id.unique():
-        e = ready_cohorts(slice_cohorts(data, sid))
-        hm = course_metrics(data, e.cohort_id.tolist())
-        if hm["enrolled"] >= 30:
-            history.append(dict(slice_id=sid, **hm))
-    hist = pd.DataFrame(history)
-    if not hist.empty:
-        trend = go.Figure()
-        for key, label, color in [("cr", "Доходимость CR", "#7397BA"), ("a_task", "Сдача A_task", "#76BAB2")]:
-            trend.add_bar(x=hist.slice_id, y=hist[key], name=label, marker_color=color,
-                          hovertemplate="%{x}: %{y:.1%}<extra>" + label + "</extra>")
-        trend.add_scatter(x=hist.slice_id, y=hist.hi, name="HI_core", mode="lines+markers",
-                          line=dict(color="#253E66", width=3), hovertemplate="%{x}: %{y:.3f}<extra>HI_core</extra>")
-        for value in [.30, .50]:
-            trend.add_hline(y=value, line_dash="dot", line_color="#7C8DA0", annotation_text=f"HI {value:.2f}")
-        trend.update_layout(barmode="group")
-        trend.update_yaxes(range=[0, 1.04], tickformat=".0%")
-        st.plotly_chart(chart_layout(trend), width="stretch", key="course_history")
-        st.caption("Каждый столбец — отдельный непересекающийся срез одной версии. Линии 0,30 и 0,50 относятся только к HI_core. Это демосценарии, а не доказательство эффекта изменений.")
-    with st.expander("Данные по потокам и формулы"):
-        display = comp[["name", "enrolled", "finished", "attempted", "passed", "cr", "a_task", "hi", "nps_n", "nps_rr"]].copy()
-        display.columns = ["Поток", "Зачислены", "Финалисты", "Приступили", "Сдали", "CR", "A_task", "HI_core", "Ответов NPS", "Охват NPS"]
-        st.dataframe(display.style.format({k: "{:.1%}" for k in ["CR", "A_task", "HI_core", "Охват NPS"]}, na_rep="—"), hide_index=True, width="stretch")
-        st.code("CR = Finished / Enrolled\nA_task = Passed_Task / Finished\nHI_core = Passed_Task / Enrolled = CR × A_task\nTask_Fail = No_Show + Rubric_Fail = 1 − A_task\nUnconfirmed_Share = (Finished − Passed_Task) / Enrolled", language="text")
+        badge = "🟢 Штатный модуль" if mhi_valid else "⚪ Мало данных опроса (поведение в LMS в норме)"
+
+    return expanded, badge, scenarios
 
 
-def render_modules(data, cohorts, table, per_cohort):
-    st.subheader("Где возникают затруднения")
-    st.caption("Все модули выбранного среза на одном экране. MHI описывает опыт завершивших практику; серые значения не участвуют в содержательной интерпретации.")
-    if (table.closed_cohorts < table.total_cohorts).any():
-        st.info("Часть окон ещё открыта. COR показывает фактически приступивших во всех потоках среза; отсев, задолженность и опросы рассчитаны только по закрытым окнам. Число закрытых потоков указано в каждой строке.")
-    cells = []
-    for _, r in table.iterrows():
-        zones = module_zones(r, r.course_drop)
-        title = f"М{int(r.module_no)} · {escape(r.title)}"
-        if r.local_anomaly:
-            title += f"<small>⚡ {escape(r.local_anomaly)} — один поток</small>"
-        if r.n < 15:
-            title += "<small>⚠ Малая база модуля</small>"
-        title += f"<small>Закрыто окон: {int(r.closed_cohorts)}/{int(r.total_cohorts)}</small>"
-        cor = f"{pct(r.cor)}<small>Начали {int(r.started_total)}/{int(r.enrolled)}<br>Паузы в закрытых окнах: {int(r.paused)}</small>"
-        drop_text = html_cell(pct(r["drop"]), zones["drop"], f"Официально: {int(r.official)}; неактивность: {int(r.inactive)}; база: {int(r.n)}")
-        lag_text = html_cell(pct(r.lag), zones["lag"], f"Задолжников: {int(r.lagging)} из {int(r.n)}")
-        coverage = f"{pct(r.rr, 0)}<small>{int(r.m)}/{int(r.n)} чел.</small>"
-        cells.append([title, cor, drop_text, lag_text, coverage] +
-                     [html_cell(pct(r[key]), zones[key], "От ответивших на опрос" if key != "loop" else "От активной базы модуля; независимо от MHI")
-                      for key in ("rushed", "slow", "fragmented", "depleted", "loop")])
-    html_table(["Модуль", "COR", "Отсев", "В досдаче", "Охват MHI", "Спешат", "Медленно", "Несвязно", "Истощены", "Петли"], cells)
-    st.caption("Наведите курсор на значение для базы расчёта. Пороги: отсев >10% / >15%; досдача >20%; спешка >25% / >30%; несвязность и петли >15% / >20%; истощение >25%; медленно >20%.")
-    st.subheader("Карта удержания")
-    valid_drop = table["drop"].where(table.lms_valid)
-    bar_colors = ["#CCD4DF" if pd.isna(x) else f"rgb({int(111 + min(x / .4, 1) * 80)}, {int(156 - min(x / .4, 1) * 90)}, {int(181 - min(x / .4, 1) * 100)})" for x in valid_drop]
-    fig = go.Figure(go.Bar(x=[f"М{n}" for n in table.module_no], y=table.cor,
-                           marker_color=bar_colors, text=[pct(x, 0) for x in table.cor], textposition="outside",
-                           customdata=np.array([[r.title, pct(r["drop"]), pct(r.lag), int(r.n)] for _, r in table.iterrows()], dtype=object),
-                           hovertemplate="%{customdata[0]}<br>COR %{y:.1%}<br>Отсев %{customdata[1]} · досдача %{customdata[2]}<br>Активная база закрытых окон: %{customdata[3]}<extra></extra>"))
-    fig.add_hline(y=.65, line_dash="dot", line_color="#8B9DB1", annotation_text="Ориентир выпуска 65%")
-    fig.update_yaxes(range=[0, 1.12], tickformat=".0%")
-    st.plotly_chart(chart_layout(fig, 285), width="stretch", key="module_funnel")
-    st.caption("Высота — факт достижения модуля, включая паузы; цвет — локальный отсев по закрытым окнам. Это разные базы. Ориентир 65% относится к выпуску курса.")
-    st.subheader("Гипотезы для проверки")
-    for _, r in table.iterrows():
-        zones = module_zones(r, r.course_drop)
-        severity = "red" if "red" in zones.values() else "yellow" if "yellow" in zones.values() else "green" if r.mhi_valid else "gray"
-        insights = module_insights(r)
-        title = f"{ICONS[severity]} М{int(r.module_no)} · {r.title} — {insights[0][1]}"
-        with st.expander(title, expanded=severity in ("red", "yellow")):
-            left, right = st.columns([1, 1.7], gap="large")
-            with left:
-                st.markdown(f"**Активная база:** {int(r.n)} · **Ответили:** {int(r.m)} ({pct(r.rr)})")
-                st.write(f"Отсев {pct(r['drop'])} · в досдаче {pct(r.lag)} · петли ошибок {pct(r.loop)}")
-                st.caption(f"Сдали {int(r.passed)} + задолжники {int(r.lagging)} + отсев {int(r.dropped)} = {int(r.n)}. Паузы {int(r.paused)} исключены из активной базы.")
-                if r.local_anomaly:
-                    st.warning(f"⚡ Только {r.local_anomaly} имеет диагностические сигналы. Сначала проверьте локальный сбой.")
-                if r.n < 15:
-                    st.warning("Оценка предварительная: активная база <15.")
-            with right:
-                for scenario_id, hypothesis, checklist in insights:
-                    st.markdown(f"**{('Сценарий ' + str(scenario_id) + ' · ') if scenario_id else ''}{hypothesis}**")
-                    for item in checklist:
-                        st.markdown(f"- {item}")
-            if not per_cohort.empty:
-                detail = per_cohort.loc[per_cohort.module_no.eq(r.module_no), ["cohort_id", "n", "m", "drop", "lag", "loop", "rr"]].copy()
-                names = cohorts.set_index("cohort_id").cohort_name.to_dict()
-                detail["cohort_id"] = detail.cohort_id.map(names)
-                detail.columns = ["Поток", "Активная база", "Ответили", "Отсев", "Досдача", "Петли", "Охват"]
-                st.dataframe(detail.style.format({k: "{:.1%}" for k in ["Отсев", "Досдача", "Петли", "Охват"]}, na_rep="—"), hide_index=True, width="stretch")
+# =====================================================================
+# САЙДБАР И УПРАВЛЕНИЕ СРЕЗОМ
+# =====================================================================
+st.sidebar.title("🧭 Управление аудитом")
+selected_slice_name = st.sidebar.selectbox(
+    "Выберите активный срез (Audit Slice):",
+    options=list(slices_data.keys()),
+    index=0
+)
+
+current_slice = slices_data[selected_slice_name]
+enrolled_n = current_slice["enrolled"]
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("📏 Индикатор выборки")
+if enrolled_n >= 30:
+    st.sidebar.success(f"✅ Выборка валидна: **N = {enrolled_n}** чел. (порог ≥ 30 выполнен)")
+else:
+    st.sidebar.warning(f"⏳ Накопление выборки: **N = {enrolled_n} из 30** чел.")
+    st.sidebar.progress(enrolled_n / 30.0)
+
+st.sidebar.markdown(f"**Версия программы:** `{current_slice['version']}`")
+if current_slice["anomaly_cohort"]:
+    st.sidebar.info(f"⚡ Зафиксирована локальная аномалия {current_slice['anomaly_cohort']} (отклонение > 20 п.п. от соседних когорт среза).")
+
+st.title("📊 Система диагностики качества образовательного продукта (v1.0)")
+st.caption(f"Активный срез: **{selected_slice_name}** | Интеграция логов LMS и анкеты «Пульс модуля»")
+
+# =====================================================================
+# ПРАВИЛО DATA GATING НА УРОВНЕ СРЕЗА (Enrolled < 30)
+# =====================================================================
+if enrolled_n < 30:
+    st.warning(
+        f"🔒 **Идет накопление выборки (собрано {enrolled_n} из 30). "
+        "Стратегическая аналитика курса защищена от шума малых групп.**"
+    )
+    st.stop()
 
 
-def render_service(data, cohorts, table, per_cohort):
-    roles, pulse = role_metrics(data, cohorts, table)
-    columns = st.columns(3)
-    specs = [("content", "Контент и задания", "Методисты и авторы", .85, .75),
-             ("expert", "Эксперты и спикеры", "Отдел работы с экспертами", .88, .80),
-             ("care", "Команда сопровождения", "Служба заботы и кураторы", .88, .80)]
-    for col, (key, title, owner, green, yellow) in zip(columns, specs):
-        with col:
-            kpi(title, pct(roles[key]), f"{owner} · {roles['unique']} уникальных · охват {pct(roles['coverage'], 0)}",
-                high_zone(roles[key], green, yellow, roles["unique"] >= 15))
-    st.caption("У каждого студента одинаковый вес: сначала его доля оценок 4–5 по вопросу, затем среднее по уникальным студентам. Карточки — по закрытым окнам; критический негатив проверяется отдельно в матрице.")
-    st.subheader("Качество среды по модулям")
-    alerts = friction_alerts(table)
-    cells = []
-    for _, r in table.iterrows():
-        row = [f"М{int(r.module_no)} · {escape(r.title)}"]
-        for q in QUESTIONS:
-            top, bottom = r[f"{q}_top"], r[f"{q}_bottom"]
-            zone = csi_zone(top, bottom, q, r.mhi_valid)
-            text_value = pct(top)
-            delta = alerts.get((int(r.module_no), q))
-            if delta is not None:
-                text_value += f" ↓{delta * 100:.1f} п.п."
-            row.append(html_cell(text_value, zone, f"Top-2 (4–5): {pct(top)}; Bottom-2 (1–2): {pct(bottom)}. Ответили {int(r.m)} из {int(r.n)}."))
-        row.append(f"{pct(r.rr, 0)}<small>{int(r.m)}/{int(r.n)} чел.</small>")
-        cells.append(row)
-    html_table(["Модуль", *QUESTIONS.values(), "Охват CSI"], cells)
-    st.caption("Top-2 — оценки 4–5. Bottom-2 — оценки 1–2, доступен при наведении. Красный при Bottom-2 >15% независимо от Top-2. ↓ — падение ≥15 п.п. между соседними модулями с достаточными данными.")
-    st.subheader("Кому и что проверить")
-    any_issues = False
-    for _, r in table.iterrows():
-        items = service_insights(r)
-        for title, owner, checklist in items:
-            any_issues = True
-            with st.expander(f"🔴 М{int(r.module_no)} · {title} — {owner}", expanded=True):
-                for item in checklist:
-                    st.markdown(f"- {item}")
-                if title == "Подача эксперта":
-                    mod_p = pulse.loc[pulse.module_no.eq(r.module_no)]
-                    unique = mod_p.student_id.nunique()
-                    st.caption(f"Оценок от уникальных студентов: {unique}. Для кадровых выводов нужны 15–20 и проверка однородности между потоками.")
-                    if not per_cohort.empty:
-                        cmp = per_cohort.loc[per_cohort.module_no.eq(r.module_no), ["cohort_id", "m", "q7_top", "q7_bottom", "mhi_valid"]].copy()
-                        cmp["cohort_id"] = cmp.cohort_id.map(cohorts.set_index("cohort_id").cohort_name)
-                        cmp.columns = ["Поток", "Оценок", "Top-2 В7", "Bottom-2 В7", "Достаточность"]
-                        st.dataframe(cmp.style.format({"Top-2 В7": "{:.1%}", "Bottom-2 В7": "{:.1%}"}, na_rep="—"), hide_index=True, width="stretch")
-    yellow_cells = sum(csi_zone(r[f"{q}_top"], r[f"{q}_bottom"], q, r.mhi_valid) == "yellow" for _, r in table.iterrows() for q in QUESTIONS)
-    if not any_issues:
-        if table.mhi_valid.any():
-            st.info("Красных сервисных сигналов на достаточных данных нет. " +
-                    (f"В жёлтой зоне {yellow_cells} оценок: запланируйте проверку комментариев и калибровку." if yellow_cells else "Продолжайте плановое наблюдение."))
+# =====================================================================
+# ТРИ ВКЛАДКИ СИСТЕМНОГО КОНТУРА
+# =====================================================================
+tab1, tab2, tab3 = st.tabs([
+    "🌐 Часть №1. Аудит курса",
+    "🔬 Часть №2. Аудит модулей",
+    "🤝 Часть №3. Сервис и среда (CSI)"
+])
+
+
+# ---------------------------------------------------------------------
+# ВКЛАДКА 1: АУДИТ КУРСА (МАКРО-УРОВЕНЬ)
+# ---------------------------------------------------------------------
+with tab1:
+    finished = current_slice["finished"]
+    attempted = current_slice["attempted_task"]
+    passed = current_slice["passed_task"]
+    nps = current_slice["nps"]
+    nps_resp = current_slice["nps_respondents"]
+    anomaly_flag = f"⚡ Локальная аномалия {current_slice['anomaly_cohort']}" if current_slice["anomaly_cohort"] else ""
+
+    cr = finished / enrolled_n
+    a_task = passed / finished if finished > 0 else 0.0
+    hi_core = passed / enrolled_n
+
+    task_fail_rate = (finished - passed) / finished if finished > 0 else 0.0
+    no_show_rate = (finished - attempted) / finished if finished > 0 else 0.0
+    rubric_fail_rate = (attempted - passed) / finished if finished > 0 else 0.0
+    unconfirmed_share = (finished - passed) / enrolled_n
+
+    nps_coverage = (nps_resp / finished * 100.0) if finished > 0 else 0.0
+    nps_valid = (nps_resp >= 15) and (nps_coverage >= 50.0)
+
+    # --- БЛОК А. Верхний ряд ключевых показателей (KPI Cards) ---
+    st.subheader("Блок А. Ключевые показатели стратегического здоровья курса")
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        if hi_core >= 0.500:
+            hi_cls, hi_lbl = "bg-green", "🟢 Целевая зона (≥ 0.500)"
+        elif hi_core >= 0.300:
+            hi_cls, hi_lbl = "bg-yellow", "🟡 Умеренная зона (0.300–0.499)"
         else:
-            st.info("Для сервисной диагностики пока недостаточно ответов на модулях.")
-    elif yellow_cells:
-        st.caption(f"Дополнительно {yellow_cells} оценок в жёлтой зоне — плановая проверка комментариев и калибровка профильной службы.")
-    st.subheader("Голос студентов")
-    options = [0] + table.module_no.astype(int).tolist()
-    labels = {int(r.module_no): f"М{int(r.module_no)} · {r.title}" for _, r in table.iterrows()}
-    chosen = st.selectbox("Комментарии по модулю", options, format_func=lambda x: "Все модули" if x == 0 else labels[x], key="comments_module")
-    comments = pulse.loc[pulse.comment.fillna("").str.strip().ne("")].copy()
-    if chosen:
-        comments = comments.loc[comments.module_no.eq(chosen)]
-    if comments.empty:
-        st.info("По данному срезу/модулю нет текстовых комментариев в открытом вопросе В10.")
+            hi_cls, hi_lbl = "bg-red", "🔴 Критическая зона (< 0.300)"
+        render_kpi_card(
+            "Сквозной HI_core",
+            f"{hi_core:.3f} ({hi_core*100:.1f}%)",
+            f"{passed} из {enrolled_n} зачисленных",
+            hi_lbl, hi_cls, anomaly_flag
+        )
+
+    with c2:
+        cr_pct = cr * 100.0
+        if cr_pct >= 65.0:
+            cr_cls, cr_lbl = "bg-green", "🟢 Высокий (≥ 65.0%)"
+        elif cr_pct >= 55.0:
+            cr_cls, cr_lbl = "bg-yellow", "🟡 Умеренный (55.0–64.9%)"
+        else:
+            cr_cls, cr_lbl = "bg-red", "🔴 Низкий (< 55.0%)"
+        render_kpi_card(
+            "Доходимость (CR)",
+            f"{cr_pct:.1f}%",
+            f"{finished} из {enrolled_n} чел.",
+            cr_lbl, cr_cls, anomaly_flag
+        )
+
+    with c3:
+        at_pct = a_task * 100.0
+        if at_pct >= 75.0:
+            at_cls, at_lbl = "bg-green", "🟢 Высокий (≥ 75.0%)"
+        elif at_pct >= 60.0:
+            at_cls, at_lbl = "bg-yellow", "🟡 Умеренный (60.0–74.9%)"
+        else:
+            at_cls, at_lbl = "bg-red", "🔴 Низкий (< 60.0%)"
+        small_fin_badge = "⚠️ Малая база финалистов, оценка предварительная" if finished < 20 else anomaly_flag
+        render_kpi_card(
+            "Сдача боевой задачи (A_task)",
+            f"{at_pct:.1f}%",
+            f"{passed} из {finished} финалистов (Приступили: {attempted})",
+            at_lbl, at_cls, small_fin_badge
+        )
+
+    with c4:
+        if not nps_valid:
+            nps_cls, nps_lbl = "bg-grey", "⚪ Мало ответов (< 15 или охват < 50%)"
+        elif nps >= 50:
+            nps_cls, nps_lbl = "bg-green", "🟢 Высокий (≥ 50)" + (" [Сверхвысокий > 60]" if nps > 60 else "")
+        elif nps >= 35:
+            nps_cls, nps_lbl = "bg-yellow", "🟡 Умеренный (35–49)"
+        else:
+            nps_cls, nps_lbl = "bg-red", "🔴 Низкий (< 35)"
+        render_kpi_card(
+            "Итоговый NPS курса",
+            f"{nps:+d}" if nps_valid else f"{nps:+d} (⚪)",
+            f"Ответили: {nps_resp} из {finished} финалистов ({nps_coverage:.0f}%)",
+            nps_lbl, nps_cls
+        )
+
+    st.markdown("---")
+
+    # --- БЛОК Б и БЛОК В ---
+    col_b, col_v = st.columns([1.15, 1.0])
+
+    with col_b:
+        st.subheader("Блок Б. Динамика валидных срезов во времени")
+        valid_slices = [s for s in slices_data.values() if s["enrolled"] >= 30]
+        x_labels = [s["id"] for s in valid_slices]
+        cr_series = [s["finished"] / s["enrolled"] for s in valid_slices]
+        at_series = [s["passed_task"] / s["finished"] for s in valid_slices]
+        hi_series = [s["passed_task"] / s["enrolled"] for s in valid_slices]
+
+        fig_dyn = go.Figure()
+        fig_dyn.add_trace(go.Bar(
+            x=x_labels, y=cr_series, name="Доходимость (CR)",
+            marker_color="#5B9BD5", text=[f"{v*100:.1f}%" for v in cr_series], textposition="auto"
+        ))
+        fig_dyn.add_trace(go.Bar(
+            x=x_labels, y=at_series, name="Сдача задачи (A_task)",
+            marker_color="#4ECDC4", text=[f"{v*100:.1f}%" for v in at_series], textposition="auto"
+        ))
+        fig_dyn.add_trace(go.Scatter(
+            x=x_labels, y=hi_series, name="Сквозной HI_core",
+            mode="lines+markers+text",
+            text=[f"{v:.3f}" for v in hi_series], textposition="top center",
+            line=dict(color="#1F2937", width=3.5),
+            marker=dict(size=9, color="#1F2937")
+        ))
+        fig_dyn.add_hline(
+            y=0.50, line_dash="dash", line_color="#2E7D32",
+            annotation_text="Целевой HI_core ≥ 0.50", annotation_position="top left"
+        )
+        fig_dyn.add_hline(
+            y=0.30, line_dash="dash", line_color="#C62828",
+            annotation_text="Критическая граница HI_core = 0.30", annotation_position="bottom left"
+        )
+        fig_dyn.update_layout(
+            barmode="group",
+            yaxis=dict(title="Доля / Индекс (0.0 – 1.0)", range=[0, 1.05], tickformat=".0%"),
+            xaxis=dict(title="Валидные срезы"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            height=380,
+            margin=dict(l=20, r=20, t=40, b=20),
+            plot_bgcolor="white"
+        )
+        st.plotly_chart(fig_dyn, use_container_width=True)
+
+    with col_v:
+        st.subheader("Блок В. Воронка подтверждения навыка (от базы Enrolled)")
+        hi_bar_color = "#34A853" if at_pct >= 75.0 else ("#FBBC04" if at_pct >= 60.0 else "#EA4335")
+
+        fig_funnel = go.Figure()
+        fig_funnel.add_trace(go.Bar(
+            y=["Дошли и подтвердили навык (HI_core)", "Дошли до финала (CR)"],
+            x=[hi_core * 100.0, cr * 100.0],
+            orientation="h",
+            marker_color=[hi_bar_color, "#4A90E2"],
+            text=[
+                f"{hi_core*100:.1f}% ({passed} из {enrolled_n} чел.)",
+                f"{cr*100:.1f}% ({finished} из {enrolled_n} чел.)"
+            ],
+            textposition="auto"
+        ))
+        fig_funnel.update_layout(
+            xaxis=dict(title="% от числа зачисленных (Enrolled)", range=[0, 100]),
+            height=210,
+            margin=dict(l=20, r=20, t=20, b=20),
+            plot_bgcolor="white"
+        )
+        st.plotly_chart(fig_funnel, use_container_width=True)
+
+        st.markdown(
+            f"* **Доля финалистов без подтверждения навыка (`Task_Fail_Rate = 1 - A_task`):** `{task_fail_rate*100:.1f}%` "
+            f"*(Не приступили к проекту: `{no_show_rate*100:.1f}%` | Не прошли по рубрикатору: `{rubric_fail_rate*100:.1f}%`)*\n"
+            f"* **Доля «холостого выпуска» от всех зачисленных (`Unconfirmed_Share = CR - HI_core`):** `{unconfirmed_share*100:.1f}%`"
+        )
+
+        if hi_core >= 0.500 and cr_pct >= 65.0 and at_pct >= 75.0:
+            st.success("🟢 Образовательный выход сбалансирован: высокая доходимость подкреплена успешной защитой независимого проекта.")
+        elif cr_pct >= 65.0 and at_pct < 60.0:
+            st.warning(
+                f"⚠️ Внимание: разрыв подтверждения результата! До финала дошли {cr_pct:.1f}%, но подтвердили квалификацию "
+                f"только {hi_core*100:.1f}% от поступивших ({task_fail_rate*100:.1f}% финалистов остались без подтвержденного результата: "
+                f"{no_show_rate*100:.1f}% не представили работу, {rubric_fail_rate*100:.1f}% не прошли по рубрикатору)."
+            )
+        elif cr_pct < 55.0 and at_pct >= 75.0:
+            st.info(
+                f"ℹ️ Синдром жесткого фильтра: высокая сдача итогового проекта ({at_pct:.1f}% финалистов) "
+                f"достигается ценой потери {100.0 - cr_pct:.1f}% студентов на дистанции курса."
+            )
+        else:
+            cr_state = "целевой норме" if cr_pct >= 65.0 else ("умеренной зоне" if cr_pct >= 55.0 else "зоне риска")
+            at_state = "целевой норме" if at_pct >= 75.0 else ("умеренной зоне" if at_pct >= 60.0 else "зоне риска")
+            st.info(
+                f"ℹ️ Комбинированный статус: удержание (CR = {cr_pct:.1f}%) находится в {cr_state}, "
+                f"подтверждение результата (A_task = {at_pct:.1f}%) — в {at_state} "
+                f"(не приступили к диплому: {no_show_rate*100:.1f}%, не прошли по критериям: {rubric_fail_rate*100:.1f}%)."
+            )
+
+    st.markdown("---")
+
+    # --- БЛОК Г. Автоматическая исследовательская записка (НАТИВНЫЕ КОНТЕЙНЕРЫ БЕЗ СЫРОГО HTML) ---
+    st.subheader("Блок Г. Автоматическая исследовательская записка")
+    note_col1_text, note_col2_text = evaluate_macro_scenario(
+        hi_core, cr_pct, at_pct, nps, nps_valid,
+        no_show_rate * 100.0, rubric_fail_rate * 100.0, unconfirmed_share * 100.0
+    )
+    g1, g2 = st.columns(2)
+    with g1:
+        with st.container(border=True):
+            st.markdown("#### 📌 Колонка 1: «Что показывают данные»")
+            st.markdown(note_col1_text)
+    with g2:
+        with st.container(border=True):
+            st.markdown("#### 🛠️ Колонка 2: «Гипотезы и вектор действий»")
+            st.markdown(note_col2_text)
+
+
+# ---------------------------------------------------------------------
+# ВКЛАДКА 2: АУДИТ МОДУЛЕЙ (МЕЗО-УРОВЕНЬ)
+# ---------------------------------------------------------------------
+with tab2:
+    modules_raw = current_slice["modules"]
+    processed_modules = []
+
+    for m in modules_raw:
+        s_started = m["started"]
+        p_paused = m["paused"]
+        n_active = s_started - p_paused
+        dropped_total = m["dropped_official"] + m["dropped_inactive"]
+        m_resp = m["mhi_resp"]
+
+        cor_mod = (s_started / enrolled_n * 100.0) if enrolled_n > 0 else 0.0
+        drop_rate = (dropped_total / n_active * 100.0) if n_active > 0 else 0.0
+        lagging_rate = (m["lagging"] / n_active * 100.0) if n_active > 0 else 0.0
+        mhi_resp_rate = (m_resp / n_active * 100.0) if n_active > 0 else 0.0
+        mhi_valid = (m_resp >= 15) and (mhi_resp_rate >= 50.0)
+
+        rushed_pct = (m["rushed_cnt"] / m_resp * 100.0) if m_resp > 0 else 0.0
+        slow_pct = (m["slow_cnt"] / m_resp * 100.0) if m_resp > 0 else 0.0
+        frag_pct = (m["frag_cnt"] / m_resp * 100.0) if m_resp > 0 else 0.0
+        depl_pct = (m["depl_cnt"] / m_resp * 100.0) if m_resp > 0 else 0.0
+        loop_fail_pct = (m["loop_fail_users"] / n_active * 100.0) if n_active > 0 else 0.0
+
+        title_display = m["name"]
+        if m["cohort_outlier"]:
+            title_display += " ⚡"
+        if n_active < 15:
+            title_display += " ⚠️ Малая база модуля (n < 15), оценка предварительная"
+
+        processed_modules.append({
+            "num": m["num"],
+            "title_display": title_display,
+            "s_started": s_started,
+            "p_paused": p_paused,
+            "n_active": n_active,
+            "m_resp": m_resp,
+            "cor_mod": cor_mod,
+            "drop_rate": drop_rate,
+            "lagging_rate": lagging_rate,
+            "dropped_official": m["dropped_official"],
+            "dropped_inactive": m["dropped_inactive"],
+            "mhi_resp_rate": mhi_resp_rate,
+            "mhi_valid": mhi_valid,
+            "rushed": rushed_pct,
+            "slow": slow_pct,
+            "frag": frag_pct,
+            "depl": depl_pct,
+            "loop_fail": loop_fail_pct,
+            "cohort_outlier": m["cohort_outlier"]
+        })
+
+    avg_course_drop = sum(x["drop_rate"] for x in processed_modules) / len(processed_modules) if processed_modules else 0.0
+
+    # --- БЛОК А. Сводная матрица учебной среды (СБОРКА HTML БЕЗ ОТСТУПОВ) ---
+    st.subheader("Блок А. Сводная матрица учебной среды (Module Overview Matrix)")
+    st.caption(
+        "Оценка проводится по закрытым модулям после окна Cutoff (Дедлайн + 14 дней). "
+        "Наведите курсор на ячейку «Отсев и отставание», чтобы увидеть разбивку Drop_rate на официальные отчисления и неактивность > 14 дней."
+    )
+
+    html_rows = []
+    for pm in processed_modules:
+        if pm["drop_rate"] > 15.0 or (pm["drop_rate"] - avg_course_drop > 10.0):
+            drop_cls = "cell-red"
+        elif pm["drop_rate"] > 10.0 or pm["lagging_rate"] > 20.0:
+            drop_cls = "cell-yellow"
+        else:
+            drop_cls = "cell-norm"
+
+        drop_tooltip = (
+            f"Активная база n = {pm['n_active']} чел. | "
+            f"Официальные отчисления: {pm['dropped_official']} чел. ({pm['dropped_official']/pm['n_active']*100:.1f}%) | "
+            f"Неактивность > 14 дн.: {pm['dropped_inactive']} чел. ({pm['dropped_inactive']/pm['n_active']*100:.1f}%)"
+        )
+
+        if not pm["mhi_valid"]:
+            rushed_cell = f'<td class="cell-grey">⚪ Мало данных ({pm["rushed"]:.1f}%)</td>'
+            slow_cell = f'<td class="cell-grey">⚪ Мало данных ({pm["slow"]:.1f}%)</td>'
+            frag_cell = f'<td class="cell-grey">⚪ Мало данных ({pm["frag"]:.1f}%)</td>'
+            depl_cell = f'<td class="cell-grey">⚪ Мало данных ({pm["depl"]:.1f}%)</td>'
+        else:
+            r_cls = "cell-red" if pm["rushed"] > 30.0 else ("cell-yellow" if pm["rushed"] > 25.0 else "cell-norm")
+            s_cls = "cell-yellow" if pm["slow"] > 20.0 else "cell-norm"
+            f_cls = "cell-red" if pm["frag"] > 20.0 else ("cell-yellow" if pm["frag"] > 15.0 else "cell-norm")
+            d_cls = "cell-red" if pm["depl"] > 25.0 else "cell-norm"
+
+            rushed_cell = f'<td class="{r_cls}">{pm["rushed"]:.1f}%</td>'
+            slow_cell = f'<td class="{s_cls}">{pm["slow"]:.1f}%</td>'
+            frag_cell = f'<td class="{f_cls}">{pm["frag"]:.1f}%</td>'
+            depl_cell = f'<td class="{d_cls}">{pm["depl"]:.1f}%</td>'
+
+        l_cls = "cell-red" if pm["loop_fail"] > 20.0 else ("cell-yellow" if pm["loop_fail"] > 15.0 else "cell-norm")
+
+        row_str = (
+            f'<tr>'
+            f'<td class="cell-norm" style="font-weight:600;">{pm["title_display"]}</td>'
+            f'<td class="cell-norm"><b>{pm["cor_mod"]:.1f}%</b> <span style="color:#4b5563; font-size:0.8rem;">(приступили: {pm["s_started"]} из {enrolled_n} чел., на паузе: {pm["p_paused"]} чел.)</span></td>'
+            f'<td class="{drop_cls}" title="{drop_tooltip}">Отсев: {pm["drop_rate"]:.1f}% | В досдаче: {pm["lagging_rate"]:.1f}% ℹ️</td>'
+            f'<td class="cell-norm">{pm["mhi_resp_rate"]:.0f}% ({pm["m_resp"]}/{pm["n_active"]} чел.)</td>'
+            f'{rushed_cell}{slow_cell}{frag_cell}{depl_cell}'
+            f'<td class="{l_cls}">{pm["loop_fail"]:.1f}%</td>'
+            f'</tr>'
+        )
+        html_rows.append(row_str)
+
+    table_html = (
+        '<div class="custom-table-wrap"><table class="custom-table">'
+        '<thead><tr>'
+        '<th>1. Модуль курса</th>'
+        '<th>2. Кумулятивное удержание (COR_mod)</th>'
+        '<th>3. Отсев и отставание (Drop | Lagging)</th>'
+        '<th>4. Охват MHI</th>'
+        '<th>5. Спешат (% Rushed)</th>'
+        '<th>6. Заниженный темп (% Slow)</th>'
+        '<th>7. Хаос (% Fragmented)</th>'
+        '<th>8. Истощены (% Depleted)</th>'
+        '<th>9. Петли ошибок (% Loop Fail)</th>'
+        '</tr></thead>'
+        f'<tbody>{"".join(html_rows)}</tbody>'
+        '</table></div>'
+    )
+    st.markdown(table_html, unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # --- БЛОК Б. Воронка модульного удержания (Drop-off Map) ---
+    st.subheader("Блок Б. Воронка модульного удержания (Drop-off Map)")
+    fig_dropoff = go.Figure()
+    fig_dropoff.add_trace(go.Bar(
+        x=[pm["title_display"] for pm in processed_modules],
+        y=[pm["cor_mod"] for pm in processed_modules],
+        text=[f"COR: {pm['cor_mod']:.1f}% (Отсев шага: {pm['drop_rate']:.1f}%)" for pm in processed_modules],
+        textposition="auto",
+        marker=dict(
+            color=[pm["drop_rate"] for pm in processed_modules],
+            colorscale=[[0.0, "#4A90E2"], [0.5, "#F5A623"], [1.0, "#D0021B"]],
+            cmin=0, cmax=25,
+            colorbar=dict(title="Drop_rate (%)")
+        )
+    ))
+    fig_dropoff.add_hline(
+        y=65.0, line_dash="dash", line_color="#137333",
+        annotation_text="Ориентир нормативного выпуска курса (65%)", annotation_position="top right"
+    )
+    fig_dropoff.update_layout(
+        yaxis=dict(title="Кумулятивная доля удержания COR_mod (%)", range=[0, 108]),
+        xaxis=dict(title="Последовательность модулей программы"),
+        height=350,
+        margin=dict(l=20, r=20, t=30, b=20),
+        plot_bgcolor="white"
+    )
+    st.plotly_chart(fig_dropoff, use_container_width=True)
+
+    st.markdown("---")
+
+    # --- БЛОК В. Исследовательские карточки модулей (LXD Insight Cards) ---
+    st.subheader("Блок В. Исследовательские карточки модулей (LXD Insight Cards)")
+    for pm in processed_modules:
+        expanded_flag, badge_str, mod_scenarios = diagnose_module_lxd(pm, avg_course_drop)
+        with st.expander(f"{pm['title_display']} — {badge_str}", expanded=expanded_flag):
+            left_c, right_c = st.columns([1.0, 1.4])
+            with left_c:
+                st.markdown("**Ключевые метрики модуля и нормативные границы:**")
+                st.markdown(
+                    f"* **Активная база модуля (`Students_in_module`):** `{pm['n_active']}` чел. (приступили `{pm['s_started']}`, на паузе `{pm['p_paused']}`)\n"
+                    f"* **Локальный отсев (`Drop_rate`):** `{pm['drop_rate']:.1f}%` *(норма ≤ 10.0%, риск > 15.0%)* — "
+                    f"офиц. отчисления: `{pm['dropped_official']}`, неактивность > 14 дн.: `{pm['dropped_inactive']}`\n"
+                    f"* **В досдаче (`Lagging_rate`):** `{pm['lagging_rate']:.1f}%` *(норма ≤ 20.0%)*\n"
+                    f"* **Петли 3+ ошибок (`% Loop Fail`):** `{pm['loop_fail']:.1f}%` *(норма ≤ 15.0%, красная > 20.0%)*\n"
+                    f"* **Охват опроса MHI:** `{pm['mhi_resp_rate']:.0f}%` (`{pm['m_resp']}/{pm['n_active']}` чел. — "
+                    f"{'валиден' if pm['mhi_valid'] else '⚪ мало данных'})\n"
+                    f"* **Спешат (`% Rushed`):** `{pm['rushed']:.1f}%` *(норма ≤ 25.0%, красная > 30.0%)*\n"
+                    f"* **Заниженный темп (`% Slow`):** `{pm['slow']:.1f}%` *(ориентир ≤ 20.0%)*\n"
+                    f"* **Хаос (`% Fragmented`):** `{pm['frag']:.1f}%` *(норма ≤ 15.0%, красная > 20.0%)*\n"
+                    f"* **Истощены (`% Depleted`):** `{pm['depl']:.1f}%` *(норма ≤ 25.0%)*"
+                )
+            with right_c:
+                st.markdown("**Диагностическое заключение (модель LXD) и чек-лист верификации:**")
+                if pm["cohort_outlier"]:
+                    st.info("⚡ **Выброс в 1 потоке:** аномалия зафиксирована только в одной когорте среза. Проверьте локальный сбой расписания или замену куратора перед правкой контента.")
+                for sc in mod_scenarios:
+                    st.markdown(f"**{sc['title']}**")
+                    st.caption(f"Вероятное состояние среды: {sc['hypothesis']}")
+                    for item in sc["checklist"]:
+                        st.markdown(item)
+
+
+# ---------------------------------------------------------------------
+# ВКЛАДКА 3: СЕРВИС И СРЕДА (CSI)
+# ---------------------------------------------------------------------
+with tab3:
+    u_resp = current_slice["u_resp"]
+    u_coverage = (u_resp / enrolled_n * 100.0) if enrolled_n > 0 else 0.0
+    t2_u = current_slice["top2_unique"]
+
+    csi_content = (t2_u["q4"] + t2_u["q5"] + t2_u["q6"]) / 3.0
+    csi_expert = t2_u["q7"]
+    csi_care = (t2_u["q8"] + t2_u["q9"]) / 2.0
+
+    # --- БЛОК А. Верхний ряд ролевых KPI (Service Health Summary) ---
+    st.subheader("Блок А. Сводные ролевые субиндексы по уникальным респондентам среза")
+    sc1, sc2, sc3 = st.columns(3)
+
+    cov_sub = f"Охват среза: {u_coverage:.1f}%, {u_resp} уникальных студентов"
+
+    with sc1:
+        if u_resp < 15:
+            c_cls, c_lbl = "bg-grey", "⚪ Мало данных (U_resp < 15)"
+        elif csi_content >= 85.0:
+            c_cls, c_lbl = "bg-green", "🟢 Целевая зона (≥ 85.0%)"
+        elif csi_content >= 75.0:
+            c_cls, c_lbl = "bg-yellow", "🟡 Зона калибровки (75.0–84.9%)"
+        else:
+            c_cls, c_lbl = "bg-red", "🔴 Выраженное трение (< 75.0%)"
+        render_kpi_card(
+            "Контент и задания (В4–6)",
+            f"{csi_content:.1f}%",
+            f"Зона ответственности методистов и авторов | {cov_sub}",
+            c_lbl, c_cls
+        )
+
+    with sc2:
+        if u_resp < 15:
+            e_cls, e_lbl = "bg-grey", "⚪ Мало данных (U_resp < 15)"
+        elif csi_expert >= 88.0:
+            e_cls, e_lbl = "bg-green", "🟢 Целевая зона (≥ 88.0%)"
+        elif csi_expert >= 80.0:
+            e_cls, e_lbl = "bg-yellow", "🟡 Зона калибровки (80.0–87.9%)"
+        else:
+            e_cls, e_lbl = "bg-red", "🔴 Выраженное трение (< 80.0%)"
+        render_kpi_card(
+            "Эксперты и спикеры (В7)",
+            f"{csi_expert:.1f}%",
+            f"Отдел работы с экспертами (ОРЭ) | {cov_sub}",
+            e_lbl, e_cls
+        )
+
+    with sc3:
+        if u_resp < 15:
+            k_cls, k_lbl = "bg-grey", "⚪ Мало данных (U_resp < 15)"
+        elif csi_care >= 88.0:
+            k_cls, k_lbl = "bg-green", "🟢 Целевая зона (≥ 88.0%)"
+        elif csi_care >= 80.0:
+            k_cls, k_lbl = "bg-yellow", "🟡 Зона калибровки (80.0–87.9%)"
+        else:
+            k_cls, k_lbl = "bg-red", "🔴 Выраженное трение (< 80.0%)"
+        render_kpi_card(
+            "Команда сопровождения (В8–9)",
+            f"{csi_care:.1f}%",
+            f"Служба заботы и кураторы | {cov_sub}",
+            k_lbl, k_cls
+        )
+
+    st.markdown("---")
+
+    # --- БЛОК Б. Детальная матрица рейтингов модулей (СБОРКА HTML БЕЗ ОТСТУПОВ) ---
+    st.subheader("Блок Б. Детальная матрица рейтингов модулей (CSI Matrix, Top-2 Box)")
+    st.caption(
+        "Наведите курсор на ячейку для просмотра доли критического негатива (Bottom-2 Box, оценки 1–2). "
+        "Индикатор 📉 фиксирует резкий перепад восприятия (падение Top-2 Box на ≥ 15.0 п.п. к предыдущему модулю)."
+    )
+
+    csi_rows_html = []
+    prev_mod_valid = False
+    prev_top2 = {}
+
+    for m in modules_raw:
+        n_active = m["started"] - m["paused"]
+        m_resp = m["mhi_resp"]
+        resp_rate = (m_resp / n_active * 100.0) if n_active > 0 else 0.0
+        cell_valid = (m_resp >= 15) and (resp_rate >= 50.0)
+
+        cells_html = []
+        q_keys = ["q4", "q5", "q6", "q7", "q8", "q9"]
+
+        for qk in q_keys:
+            t2 = m["csi_top2"][qk]
+            b2 = m["csi_bot2"][qk]
+            is_content = qk in ("q4", "q5", "q6")
+
+            if not cell_valid:
+                c_cls = "cell-grey"
+                val_str = f"⚪ Мало данных ({t2:.1f}%)"
+            else:
+                drop_alert = ""
+                if prev_mod_valid and (prev_top2.get(qk, t2) - t2 >= 15.0):
+                    diff = prev_top2[qk] - t2
+                    drop_alert = f' <span style="color:#c5221f; font-weight:700;">📉 -{diff:.1f} п.п.</span>'
+
+                green_thr = 85.0 if is_content else 88.0
+                yellow_thr = 75.0 if is_content else 80.0
+
+                if t2 < yellow_thr or b2 > 15.0:
+                    c_cls = "cell-red"
+                elif t2 < green_thr:
+                    c_cls = "cell-yellow"
+                else:
+                    c_cls = "cell-green"
+
+                val_str = f"{t2:.1f}%{drop_alert}"
+
+            tooltip = f"Top-2 Box (оценки 4-5): {t2:.1f}% | Bottom-2 Box (оценки 1-2): {b2:.1f}%"
+            cells_html.append(f'<td class="{c_cls}" title="{tooltip}">{val_str}</td>')
+
+        row_str = (
+            f'<tr>'
+            f'<td class="cell-norm" style="font-weight:600;">{m["name"]}</td>'
+            f'{"".join(cells_html)}'
+            f'<td class="cell-norm">{resp_rate:.0f}% ({m_resp}/{n_active} чел.)</td>'
+            f'</tr>'
+        )
+        csi_rows_html.append(row_str)
+
+        prev_mod_valid = cell_valid
+        prev_top2 = m["csi_top2"]
+
+    csi_table_html = (
+        '<div class="custom-table-wrap"><table class="custom-table">'
+        '<thead><tr>'
+        '<th>Модуль программы</th>'
+        '<th>В4: Теория (%)</th>'
+        '<th>В5: Актуальность (%)</th>'
+        '<th>В6: Задания (%)</th>'
+        '<th>В7: Спикеры (%)</th>'
+        '<th>В8: Скорость / SLA (%)</th>'
+        '<th>В9: Эмпатия (%)</th>'
+        '<th>Охват CSI</th>'
+        '</tr></thead>'
+        f'<tbody>{"".join(csi_rows_html)}</tbody>'
+        '</table></div>'
+    )
+    st.markdown(csi_table_html, unsafe_allow_html=True)
+
+    with st.expander("📋 Чек-листы верификации сервисных сбоев для профильных отделов (по матрице п. 1.4)", expanded=False):
+        st.markdown(
+            "* **Контент и практика (В4–В6 < 75.0% или Bottom-2 > 15.0%):** изучить комментарии В10 и сверить с `% Loop Fail`; провести ревизию формулировок ДЗ, автотестов и опубликовать чек-лист самопроверки; обновить проблемные фрагменты теории.\n"
+            "* **Эксперты курса (В7 < 80.0% или Bottom-2 > 15.0%):** проверить однородность оценки между потоками среза; отсмотреть запись вебинара по чек-листу динамики; провести развивающий брифинг со спикером.\n"
+            "* **Команда заботы — Восприятие скорости (В8 < 80.0% или Bottom-2 > 15.0%):** выгрузить из тикет-системы/LMS фактическое время первого ответа и проверки ДЗ (проверить реальное нарушение SLA > 24–48 ч); перераспределить нагрузку в пиковые дни или подсветить регламентные сроки студентам.\n"
+            "* **Команда заботы — Эмпатия и ToV (В9 < 80.0% или Bottom-2 > 15.0%):** провести выборочный аудит текста комментариев ревьюеров и чатов на проблемном модуле; откалибровать кураторов по стандарту развивающей обратной связи."
+        )
+
+    st.markdown("---")
+
+    # --- БЛОК В. Реестр качественного фидбека (НАТИВНЫЕ КОНТЕЙНЕРЫ) ---
+    st.subheader("Блок В. Реестр качественного фидбека (Вопрос В10: «Что стоит улучшить в модуле?»)")
+    module_filter_options = ["Все модули"] + [m["name"] for m in modules_raw]
+    selected_mod_filter = st.selectbox("Фильтр по модулю программы:", options=module_filter_options)
+
+    filtered_comments = []
+    for m in modules_raw:
+        if selected_mod_filter in ("Все модули", m["name"]):
+            for txt in m["comments"]:
+                filtered_comments.append((m["name"], txt))
+
+    if not filtered_comments:
+        st.info("По данному срезу/модулю нет текстовых комментариев в открытом вопросе В10")
     else:
-        page_size = 8
-        pages = max(1, (len(comments) + page_size - 1) // page_size)
-        page = st.selectbox("Страница комментариев", range(1, pages + 1), key=f"comments_page_{cohorts.iloc[0].slice_id}_{chosen}")
-        st.caption(f"{len(comments)} комментариев · все тексты синтетические")
-        names = cohorts.set_index("cohort_id").cohort_name.to_dict()
-        for r in comments.sort_values(["module_no", "cohort_id", "student_id"]).iloc[(page - 1) * page_size:page * page_size].itertuples():
-            st.markdown(f'<div class="feedback"><small>{escape(labels[r.module_no])} · {escape(names[r.cohort_id])} · {escape(r.student_id)}</small>{escape(r.comment)}</div>', unsafe_allow_html=True)
-
-
-RULES = """
-**Область реализации.** Системный контур v1.0 по документу «Концепция: Система метрик (16)»:
-аудит курса, модулей, сервиса. Оперативный контур отнесён в концепции к v2.0 и здесь не реализован.
-
-**Достаточность данных.** Курс: минимум 30 зачисленных в закрытых последовательных потоках.
-При <20 финалистах A_task предварителен. NPS: минимум 15 ответов и 50% финалистов.
-Модуль: cutoff = дедлайн + 14 дней (или полностью завершённый поток); активная база минимум 15.
-MHI и модульный CSI: минимум 15 ответов и охват не ниже 50% активной базы.
-Ролевой CSI: минимум 15 уникальных респондентов. Эти пороги не означают статистической доказанности причин.
-
-**Состояния.** Сдавшие, задолжники и выбывшие — непересекающиеся состояния активной базы;
-официальная пауза до завершения исключается. Если практика была сдана, позднейший уход не меняет
-статус этого модуля. Генератор хранит уже классифицированный снимок `state` на cutoff; для настоящей
-LMS его нужно построить из событий с приоритетом «сдано → пауза до сдачи → активный задолжник → отсев».
-`loop_fail` — факт серии ≥3 неудачных попыток до cutoff, даже если позже практика сдана.
-
-**Базы.** COR = фактически начавшие модуль / все зачисленные выбранного среза.
-Локальные метрики и анкеты считаются по закрытым окнам. При частично открытом срезе их база
-может отличаться от базы COR; число закрытых потоков всегда показано. MHI может иметь охват ниже
-доли сдавших практику: некоторые останавливаются между сдачей и анкетой. Опрос обязателен перед
-следующим модулем и итоговой аттестацией.
-
-**Границы.** Все сравнения используют исходные значения до округления. Доли хранятся в диапазоне
-0–1, NPS в диапазоне −100…100. Показатель без знаменателя — «—», а не 0. Границы Baseline v1.0
-являются стартовыми ориентирами для последующей калибровки.
-
-**Решения реализации там, где документ не задаёт точный алгоритм:**
-
-- Для курса принят минимальный порог 30 (из диапазона 30–40). Аномалия потока при ≥3 потоках:
-  один отличается от каждого из остальных более чем на 20 п.п., а размах остальных ≤20 п.п.
-  При двух потоках показывается расхождение без назначения «виновного».
-- Для модулей локальная аномалия — только один поток с диагностическими сигналами среди
-  минимум трёх потоков с активной базой ≥15. Для опросных сигналов дополнительно проверяется охват.
-- Средний отсев курса для относительного порога +10 п.п. — сумма выбывших / сумма активных
-  баз модулей с n≥15. Это среднее по наблюдениям «студент × модуль», не сквозной отсев курса.
-- При n<15 поведенческие числа показаны серым как предварительные; системные гипотезы подавлены.
-- Модуль может иметь несколько одновременно применимых гипотез. Сценарий 7 запрещает выводы
-  по MHI, но не отменяет сигнал петель ошибок из LMS. Не покрытое матрицей сочетание описывается отдельно.
-- Если поток в середине среза не закрыт, итоговый аудит использует только закрытый последовательный
-  префикс. Более поздние потоки через этот разрыв не объединяются.
-- Ролевые карточки CSI используют анкеты закрытых окон и порог U≥15, как в технической части
-  концепции. Bottom-2 не меняет цвет ролевой карточки; он отдельно управляет цветом каждой ячейки
-  модульной матрицы и сервисными рекомендациями. В8 и В9 запускают оба чек-листа при общей просадке.
-
-**Подключение настоящих данных.** Замените `get_demo_data()` адаптером, возвращающим те же пять
-таблиц, и обновите `AS_OF`. До адаптера необходимо удалить технические дубли и отмены до старта,
-разметить версии и последовательность потоков, зафиксировать временные снимки и критерии
-самостоятельной сдачи. `student_id` должен устойчиво обозначать человека, а не ответ на анкету.
-Флаги закрытия и ответы не следует восстанавливать из отсутствия записей. Эта версия не подключена к LMS.
-"""
-
-
-def render_data(data, cohorts, table, seed, cohort_size):
-    st.subheader("Синтетический набор для проверки")
-    counts = st.columns(4)
-    for col, title, value in zip(counts, ["Демосрезов", "Потоков", "Студентов", "Анкет модулей"],
-                                 [data["cohorts"].slice_id.nunique(), len(data["cohorts"]), len(data["students"]), len(data["pulse"])]):
-        col.metric(title, f"{value:,}".replace(",", " "))
-    st.write(f"Снимок: **{AS_OF:%d.%m.%Y}**. Seed: **{seed}**. Размер обычного потока: **{cohort_size}**. "
-             "Каждый срез содержит три потока одной версии. В малом срезе всегда 3 × 8 студентов.")
-    errors = validate_data(data)
-    if errors:
-        for error in errors:
-            st.error(error)
-    else:
-        st.success("Контроль целостности пройден: ключи, допустимые оценки, последовательность модулей, анкеты после практики и вложенность итоговых результатов.")
-    st.download_button("Скачать все исходные данные · ZIP / CSV", dataset_zip(data, seed, cohort_size),
-                       file_name=f"synthetic_data_seed_{seed}.zip", mime="application/zip", key="download_raw")
-    st.download_button("Скачать расчёты выбранного среза · CSV", table.to_csv(index=False).encode("utf-8-sig"),
-                       file_name=f"module_audit_{cohorts.iloc[0].slice_id}.csv", mime="text/csv", key="download_metrics")
-    st.subheader("Путеводитель по демосценариям")
-    rows = data["cohorts"][["course", "version", "slice_id", "slice_label"]].drop_duplicates()
-    rows.columns = ["Курс", "Версия", "Срез", "Что проверять"]
-    st.dataframe(rows, hide_index=True, width="stretch")
-    st.subheader("Состав таблиц")
-    st.dataframe(pd.DataFrame([
-        ("cohorts", "Поток", "Курс, версия, срез, порядок, сроки аттестации, закрытие проверки"),
-        ("modules", "Поток × модуль", "Дедлайн, cutoff, преподаватель"),
-        ("students", "Поток × студент", "Итоговая попытка, независимая сдача, оценка NPS"),
-        ("progress", "Поток × студент × модуль", "Состояние на cutoff и серия ≥3 ошибок"),
-        ("pulse", "Поток × студент × модуль", "Ритм, связность, ресурс, В4–В9 и комментарий В10"),
-    ], columns=["Таблица", "Единица записи", "Содержание"]), hide_index=True, width="stretch")
-    chosen = st.selectbox("Предпросмотр исходной таблицы", list(data), key="source_table")
-    filtered = data[chosen].loc[data[chosen].cohort_id.isin(cohorts.cohort_id)]
-    st.caption(f"Выбранный срез: {len(filtered)} записей. Показаны первые 100.")
-    st.dataframe(filtered.head(100), hide_index=True, width="stretch")
-    st.subheader("Формулы, ограничения и решения реализации")
-    st.markdown(RULES)
-
-
-def main():
-    st.set_page_config(page_title="Система метрик · Аудит программ", page_icon="◈", layout="wide", initial_sidebar_state="expanded")
-    st.markdown(CSS, unsafe_allow_html=True)
-    with st.sidebar:
-        st.markdown("### ◈ Система метрик")
-        st.caption("Системный аудит · v1.0")
-        st.caption(f"Сборка {BUILD_ID}")
-        with st.expander("Генератор демоданных", expanded=False):
-            seed = int(st.number_input("Seed", min_value=0, max_value=999999, value=42, step=1, key="seed"))
-            cohort_size = int(st.slider("Студентов в потоке", min_value=30, max_value=120, value=60, step=10, key="cohort_size"))
-            st.caption("Одинаковый seed и размер дают одинаковый набор. Срез малой базы фиксирован: 24 человека.")
-        data = get_demo_data(seed, cohort_size)
-        course = st.selectbox("Образовательный продукт", data["cohorts"].course.unique(), key="course")
-        versions = data["cohorts"].loc[data["cohorts"].course.eq(course), "version"].unique()
-        version = st.selectbox("Версия программы", versions, key="version")
-        available = data["cohorts"].loc[data["cohorts"].course.eq(course) & data["cohorts"].version.eq(version)]
-        labels = available.drop_duplicates("slice_id").set_index("slice_id").slice_label.to_dict()
-        slice_id = st.selectbox("Аудиторский срез", list(labels), format_func=lambda x: f"{x} · {labels[x]}", key="slice")
-        cohorts = slice_cohorts(data, slice_id)
-        enrolled = int(data["students"].cohort_id.isin(cohorts.cohort_id).sum())
-        st.divider()
-        st.metric("Зачислено в срез", enrolled)
-        st.caption(f"{len(cohorts)} последовательных потока · версия {version}")
-        st.caption(" · ".join(cohorts.cohort_name))
-        st.info("ДЕМО · Синтетические данные\n\nРекомендации — гипотезы для проверки.")
-        st.caption(f"Снимок на {AS_OF:%d.%m.%Y}\n\nBaseline v1.0 · пороги требуют калибровки")
-    st.markdown('<div class="eyebrow">КАЧЕСТВО ОБРАЗОВАТЕЛЬНОГО ПРОДУКТА</div>', unsafe_allow_html=True)
-    st.title("От показателей к решениям")
-    st.markdown(f'<div class="subhead">{escape(course)} · версия {escape(version)} · {escape(slice_id)} · {escape(labels[slice_id])}</div>', unsafe_allow_html=True)
-    table, per_cohort = module_metrics(data, cohorts)
-    course_tab, module_tab, service_tab, data_tab = st.tabs(["Аудит курса", "Аудит модулей", "Сервис и среда", "Данные и правила"])
-    with course_tab:
-        render_course(data, cohorts)
-    with module_tab:
-        render_modules(data, cohorts, table, per_cohort)
-    with service_tab:
-        render_service(data, cohorts, table, per_cohort)
-    with data_tab:
-        render_data(data, cohorts, table, seed, cohort_size)
-
-
-if __name__ == "__main__":
-    import sys
-    if "--export-data" in sys.argv:
-        parser = argparse.ArgumentParser(description="Экспорт воспроизводимого набора синтетических данных")
-        parser.add_argument("--export-data", type=Path, required=True)
-        parser.add_argument("--seed", type=int, default=42)
-        parser.add_argument("--cohort-size", type=int, choices=range(30, 121, 10), default=60)
-        args = parser.parse_args()
-        data = generate_synthetic_data(args.seed, args.cohort_size)
-        errors = validate_data(data)
-        if errors:
-            raise ValueError("; ".join(errors))
-        args.export_data.write_bytes(dataset_zip(data, args.seed, args.cohort_size))
-        print(f"Сохранено: {args.export_data}")
-    else:
-        main()
+        for mod_title, comment_text in filtered_comments:
+            with st.container(border=True):
+                st.markdown(f"**{mod_title}**")
+                st.write(comment_text)
