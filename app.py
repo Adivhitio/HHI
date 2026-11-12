@@ -1,11 +1,5 @@
-"""Система метрик · прототип v1.0 по концепции (16).
-
-Запуск: streamlit run app.py
-Экспорт демоданных: python app.py --export-data synthetic_data.zip
-Все расчёты и воспроизводимый генератор находятся в этом файле.
-Доли внутри расчётов — 0..1; NPS — -100..100. Нули и пропуски различаются.
-См. вкладку «Данные и правила» о явно принятых решениях реализации.
-"""
+# -*- coding: utf-8 -*-
+# Dashboard build: 2026-11-12-py314
 from __future__ import annotations
 
 import argparse
@@ -22,6 +16,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 AS_OF = pd.Timestamp("2026-11-12")
+BUILD_ID = "2026-11-12-py314"
 COLORS = {"green": "#157B62", "yellow": "#A66A09", "red": "#BD414B", "gray": "#748295"}
 BG = {"green": "#E9F5EF", "yellow": "#FFF3DA", "red": "#FCEBEC", "gray": "#EDF0F4"}
 ICONS = {"green": "🟢", "yellow": "🟡", "red": "🔴", "gray": "⚪"}
@@ -1011,6 +1006,7 @@ def main():
     with st.sidebar:
         st.markdown("### ◈ Система метрик")
         st.caption("Системный аудит · v1.0")
+        st.caption(f"Сборка {BUILD_ID}")
         with st.expander("Генератор демоданных", expanded=False):
             seed = int(st.number_input("Seed", min_value=0, max_value=999999, value=42, step=1, key="seed"))
             cohort_size = int(st.slider("Студентов в потоке", min_value=30, max_value=120, value=60, step=10, key="cohort_size"))
