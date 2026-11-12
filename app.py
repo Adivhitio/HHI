@@ -290,7 +290,7 @@ slices_data = get_slices_data()
 
 
 # =====================================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ЛАКОНИЧНЫЙ ЯЗЫК ДЛЯ НЕСПЕЦИАЛИСТОВ)
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # =====================================================================
 def render_kpi_card(title, value_str, subtitle, status_label, color_class, extra_badge=""):
     badge_html = f'<div style="margin-top:6px;"><span class="kpi-badge">{extra_badge}</span></div>' if extra_badge else ""
@@ -307,23 +307,16 @@ def render_kpi_card(title, value_str, subtitle, status_label, color_class, extra
 
 
 def evaluate_macro_scenario(hi_core, cr_pct, a_task_pct, nps_val, nps_valid, no_show_pct, rubric_fail_pct, unconfirmed_pct, no_show_cnt, rubric_fail_cnt):
-    """
-    Формирует понятное резюме:
-    1) Тип баннера ('success' | 'warning' | 'error' | 'info') и короткий вердикт в 1 строку.
-    2) Лаконичную суть ситуации без повторного перечисления всех цифр.
-    3) Четкий план действий (1-2-3).
-    """
     task_fail_pct = 100.0 - a_task_pct
 
     if nps_valid:
-        # 1. Сбалансированный бенчмарк
         if hi_core >= 0.500 and cr_pct >= 65.0 and a_task_pct >= 75.0 and nps_val >= 50:
             return (
                 "success",
                 "🟢 Сбалансированный курс: студенты доходят до конца и успешно подтверждают навык на практике",
                 (
                     f"Большинство зачисленных (**{hi_core*100:.1f}%**) не просто получают сертификат, а самостоятельно справляются с финальным проектом. "
-                    f"Удержание (**{cr_pct:.1f}%**) и лояльность выпускников (**NPS {nps_val:+d}**) находятся в зеленой зоне."
+                    f"Удержание (**{cr_pct:.1f}%**) и лояльность выпускников (**NPS {nps_val:+d}**) находятся в целевой зеленой зоне."
                 ),
                 (
                     "1. **Зафиксировать текущую версию программы** как рабочий эталон.\n"
@@ -331,7 +324,6 @@ def evaluate_macro_scenario(hi_core, cr_pct, a_task_pct, nps_val, nps_valid, no_
                 )
             )
 
-        # 2. Иллюзия доходимости
         if cr_pct >= 65.0 and a_task_pct < 60.0 and (35 <= nps_val <= 60):
             return (
                 "warning",
@@ -348,7 +340,6 @@ def evaluate_macro_scenario(hi_core, cr_pct, a_task_pct, nps_val, nps_valid, no_
                 )
             )
 
-        # 3. Эмоциональная ловушка
         if cr_pct >= 65.0 and a_task_pct < 60.0 and nps_val > 60:
             return (
                 "warning",
@@ -365,7 +356,6 @@ def evaluate_macro_scenario(hi_core, cr_pct, a_task_pct, nps_val, nps_valid, no_
                 )
             )
 
-        # 4. Кризис результата и ожиданий
         if cr_pct >= 55.0 and a_task_pct < 60.0 and nps_val < 35:
             return (
                 "error",
@@ -381,7 +371,6 @@ def evaluate_macro_scenario(hi_core, cr_pct, a_task_pct, nps_val, nps_valid, no_
                 )
             )
 
-        # 5. Синдром жесткого фильтра
         if cr_pct < 55.0 and a_task_pct >= 75.0 and nps_val < 50:
             return (
                 "warning",
@@ -396,7 +385,6 @@ def evaluate_macro_scenario(hi_core, cr_pct, a_task_pct, nps_val, nps_valid, no_
                 )
             )
 
-        # 6. Системный кризис
         if hi_core < 0.300 and cr_pct < 55.0 and a_task_pct < 60.0 and nps_val < 35:
             return (
                 "error",
@@ -411,7 +399,6 @@ def evaluate_macro_scenario(hi_core, cr_pct, a_task_pct, nps_val, nps_valid, no_
                 )
             )
 
-    # Покомпонентный режим (Fallback), если показатели в промежуточной зоне или мало ответов NPS
     issues = []
     actions = []
     if cr_pct < 65.0:
@@ -443,10 +430,6 @@ def evaluate_macro_scenario(hi_core, cr_pct, a_task_pct, nps_val, nps_valid, no_
 
 
 def diagnose_module_human(pm, avg_course_drop):
-    """
-    Возвращает только реально сработавшие сигналы (без перечисления 9 метрик в норме)
-    и понятные рекомендации для команды.
-    """
     drop = pm["drop_rate"]
     lag = pm["lagging_rate"]
     loop = pm["loop_fail"]
@@ -466,7 +449,6 @@ def diagnose_module_human(pm, avg_course_drop):
     is_yellow = (not is_red) and (lms_yellow or mhi_yellow)
     is_problem = is_red or is_yellow
 
-    # Формируем список ТОЛЬКО сработавших проблемных сигналов (Что сломалось)
     triggered_signals = []
     if drop > 15.0 or (drop - avg_course_drop > 10.0):
         triggered_signals.append(
@@ -504,7 +486,6 @@ def diagnose_module_human(pm, avg_course_drop):
         if slow > 20.0:
             triggered_signals.append(f"🟡 **Слишком простой темп (Скука): {slow:.1f}%** студентов считают материал слишком медленным (норма ≤ 20%).")
 
-    # Формируем понятные диагнозы и шаги (Что делать)
     diagnoses = []
     actions = []
 
@@ -546,10 +527,7 @@ def diagnose_module_human(pm, avg_course_drop):
         diagnoses.append("**Недостаточно ответов в опросе для оценки состояния группы**")
         actions.append("Опираться на объективные показатели сдачи ДЗ и проверить доходимость до конца модуля.")
 
-    # Убираем дубликаты шагов с сохранением порядка
     unique_actions = list(dict.fromkeys(actions))
-
-    # Короткий заголовок-резюме для плашки модуля
     summary_label = " + ".join([d.replace("**", "") for d in diagnoses]) if diagnoses else "Штатный модуль без отклонений"
     if is_red:
         header_icon = "🔴"
@@ -601,7 +579,7 @@ if enrolled_n < 30:
 
 
 # =====================================================================
-# ТРИ ПОНЯТНЫЕ ВКЛАДКИ БЕЗ ТЕХНИЧЕСКИХ НОМЕРОВ БЛОКОВ
+# ВКЛАДКИ
 # =====================================================================
 tab1, tab2, tab3 = st.tabs([
     "🌐 1. Итоги курса",
@@ -612,6 +590,7 @@ tab1, tab2, tab3 = st.tabs([
 
 # ---------------------------------------------------------------------
 # ВКЛАДКА 1: ИТОГИ КУРСА
+# Порядок: 1. Главные показатели -> 2. Диагноз -> 3. Динамика и воронка
 # ---------------------------------------------------------------------
 with tab1:
     finished = current_slice["finished"]
@@ -638,36 +617,7 @@ with tab1:
     cr_pct = cr * 100.0
     at_pct = a_task * 100.0
 
-    # --- 1. СРАЗУ НАВЕРХУ: ГЛАВНЫЙ ДИАГНОЗ И ПЛАН ДЕЙСТВИЙ ПО КУРСУ ---
-    alert_type, headline_verdict, essence_text, actions_text = evaluate_macro_scenario(
-        hi_core, cr_pct, at_pct, nps, nps_valid,
-        no_show_rate * 100.0, rubric_fail_rate * 100.0, unconfirmed_share * 100.0,
-        no_show_cnt, rubric_fail_cnt
-    )
-
-    st.subheader("Диагноз и план действий по курсу")
-    if alert_type == "success":
-        st.success(f"**{headline_verdict}**")
-    elif alert_type == "warning":
-        st.warning(f"**{headline_verdict}**")
-    elif alert_type == "error":
-        st.error(f"**{headline_verdict}**")
-    else:
-        st.info(f"**{headline_verdict}**")
-
-    g1, g2 = st.columns(2)
-    with g1:
-        with st.container(border=True):
-            st.markdown("##### 📍 В чем суть ситуации")
-            st.markdown(essence_text)
-    with g2:
-        with st.container(border=True):
-            st.markdown("##### 🛠️ Что сделать команде курса")
-            st.markdown(actions_text)
-
-    st.markdown("---")
-
-    # --- 2. ГЛАВНЫЕ ПОКАЗАТЕЛИ КУРСА (4 КАРТОЧКИ) ---
+    # --- 1. ГЛАВНЫЕ ПОКАЗАТЕЛИ КУРСА ---
     st.subheader("Главные показатели курса")
     c1, c2, c3, c4 = st.columns(4)
 
@@ -732,11 +682,40 @@ with tab1:
 
     st.markdown("---")
 
-    # --- 3. ГРАФИКИ ДИНАМИКИ И ВОРОНКИ НАВЫКА ---
+    # --- 2. ДИАГНОЗ И ПЛАН ДЕЙСТВИЙ ПО КУРСУ ---
+    alert_type, headline_verdict, essence_text, actions_text = evaluate_macro_scenario(
+        hi_core, cr_pct, at_pct, nps, nps_valid,
+        no_show_rate * 100.0, rubric_fail_rate * 100.0, unconfirmed_share * 100.0,
+        no_show_cnt, rubric_fail_cnt
+    )
+
+    st.subheader("Диагноз и план действий по курсу")
+    if alert_type == "success":
+        st.success(f"**{headline_verdict}**")
+    elif alert_type == "warning":
+        st.warning(f"**{headline_verdict}**")
+    elif alert_type == "error":
+        st.error(f"**{headline_verdict}**")
+    else:
+        st.info(f"**{headline_verdict}**")
+
+    g1, g2 = st.columns(2)
+    with g1:
+        with st.container(border=True):
+            st.markdown("##### 📍 В чем суть ситуации")
+            st.markdown(essence_text)
+    with g2:
+        with st.container(border=True):
+            st.markdown("##### 🛠️ Что сделать команде курса")
+            st.markdown(actions_text)
+
+    st.markdown("---")
+
+    # --- 3. ДИНАМИКА И ВОРОНКА НАВЫКА ---
     col_b, col_v = st.columns([1.15, 1.0])
 
     with col_b:
-        st.subheader("Как менялись результаты от среза к срезу")
+        st.subheader("Динамика результатов от среза к срезу")
         valid_slices = [s for s in slices_data.values() if s["enrolled"] >= 30]
         x_labels = [s["id"] for s in valid_slices]
         cr_series = [s["finished"] / s["enrolled"] for s in valid_slices]
@@ -812,6 +791,7 @@ with tab1:
 
 # ---------------------------------------------------------------------
 # ВКЛАДКА 2: РАЗБОР ПО МОДУЛЯМ
+# Порядок: 1. Сводная карта -> 2. Воронка -> 3. Обзор модулей
 # ---------------------------------------------------------------------
 with tab2:
     modules_raw = current_slice["modules"]
@@ -866,47 +846,7 @@ with tab2:
 
     avg_course_drop = sum(x["drop_rate"] for x in processed_modules) / len(processed_modules) if processed_modules else 0.0
 
-    # --- 1. СРАЗУ ПОНЯТНЫЙ ПЛАН ДЕЙСТВИЙ ПО ПРОБЛЕМНЫМ МОДУЛЯМ (БЕЗ ВОДЫ И ЛИШНИХ ЦИФР) ---
-    st.subheader("Где сбоит программа и что нужно исправить")
-
-    problem_cards = []
-    normal_cards = []
-
-    for pm in processed_modules:
-        is_prob, icon, summary_lbl, trig_list, act_list = diagnose_module_human(pm, avg_course_drop)
-        item_tuple = (pm, icon, summary_lbl, trig_list, act_list)
-        if is_prob:
-            problem_cards.append(item_tuple)
-        else:
-            normal_cards.append(item_tuple)
-
-    if not problem_cards:
-        st.success("🟢 **Все модули курса проходят штатно!** Критических скачков отсева, перегруза или тупиков в практике не обнаружено.")
-    else:
-        st.caption(f"Обнаружены отклонения в **{len(problem_cards)} из {len(processed_modules)}** модулей курса (раскрыты ниже):")
-        for pm, icon, summary_lbl, trig_list, act_list in problem_cards:
-            with st.expander(f"{icon} {pm['title_display']} — {summary_lbl}", expanded=True):
-                if pm["cohort_outlier"]:
-                    st.info("⚡ **Локальный выброс в 1 потоке:** проблема проявилась только в одной группе среза. Сначала проверьте расписание и работу куратора в этом потоке, прежде чем переписывать контент.")
-                col_sig, col_act = st.columns([1.0, 1.2])
-                with col_sig:
-                    st.markdown("**🚩 Что пошло не так (сработавшие сигналы):**")
-                    for sig in trig_list:
-                        st.markdown(f"* {sig}")
-                with col_act:
-                    st.markdown("**🛠️ Что проверить и сделать:**")
-                    for idx_a, act in enumerate(act_list, 1):
-                        st.markdown(f"{idx_a}. {act}")
-
-    if normal_cards:
-        with st.expander(f"🟢 Показать модули без отклонений ({len(normal_cards)} шт.)", expanded=False):
-            for pm, icon, summary_lbl, trig_list, _ in normal_cards:
-                extra_note = f" — *{trig_list[0]}*" if trig_list else " — *все показатели отсева и самочувствия в норме.*"
-                st.markdown(f"* **{icon} {pm['title_display']}** (удержание `{pm['cor_mod']:.1f}%`, отсев шага `{pm['drop_rate']:.1f}%`){extra_note}")
-
-    st.markdown("---")
-
-    # --- 2. СВОДНАЯ ТАБЛИЦА ВСЕХ МОДУЛЕЙ ---
+    # --- 1. СВОДНАЯ КАРТА ПРОХОЖДЕНИЯ МОДУЛЕЙ ---
     st.subheader("Сводная карта прохождения модулей")
     st.caption(
         "Цветом подсвечены только те ячейки, где показатель вышел за пределы нормы. "
@@ -976,7 +916,9 @@ with tab2:
     )
     st.markdown(table_html, unsafe_allow_html=True)
 
-    # --- 3. ВОРОНКА УДЕРЖАНИЯ ---
+    st.markdown("---")
+
+    # --- 2. ВОРОНКА УДЕРЖАНИЯ ---
     st.subheader("Воронка удержания студентов от модуля к модулю")
     fig_dropoff = go.Figure()
     fig_dropoff.add_trace(go.Bar(
@@ -1003,6 +945,46 @@ with tab2:
         plot_bgcolor="white"
     )
     st.plotly_chart(fig_dropoff, use_container_width=True)
+
+    st.markdown("---")
+
+    # --- 3. ОБЗОР МОДУЛЕЙ (ДИАГНОЗЫ И ДЕЙСТВИЯ ПО ПРОБЛЕМНЫМ МОДУЛЯМ) ---
+    st.subheader("Обзор модулей: где сбоит программа и что нужно исправить")
+
+    problem_cards = []
+    normal_cards = []
+
+    for pm in processed_modules:
+        is_prob, icon, summary_lbl, trig_list, act_list = diagnose_module_human(pm, avg_course_drop)
+        item_tuple = (pm, icon, summary_lbl, trig_list, act_list)
+        if is_prob:
+            problem_cards.append(item_tuple)
+        else:
+            normal_cards.append(item_tuple)
+
+    if not problem_cards:
+        st.success("🟢 **Все модули курса проходят штатно!** Критических скачков отсева, перегруза или тупиков в практике не обнаружено.")
+    else:
+        st.caption(f"Обнаружены отклонения в **{len(problem_cards)} из {len(processed_modules)}** модулей курса (раскрыты ниже):")
+        for pm, icon, summary_lbl, trig_list, act_list in problem_cards:
+            with st.expander(f"{icon} {pm['title_display']} — {summary_lbl}", expanded=True):
+                if pm["cohort_outlier"]:
+                    st.info("⚡ **Локальный выброс в 1 потоке:** проблема проявилась только в одной группе среза. Сначала проверьте расписание и работу куратора в этом потоке, прежде чем переписывать контент.")
+                col_sig, col_act = st.columns([1.0, 1.2])
+                with col_sig:
+                    st.markdown("**🚩 Что пошло не так (сработавшие сигналы):**")
+                    for sig in trig_list:
+                        st.markdown(f"* {sig}")
+                with col_act:
+                    st.markdown("**🛠️ Что проверить и сделать:**")
+                    for idx_a, act in enumerate(act_list, 1):
+                        st.markdown(f"{idx_a}. {act}")
+
+    if normal_cards:
+        with st.expander(f"🟢 Показать модули без отклонений ({len(normal_cards)} шт.)", expanded=False):
+            for pm, icon, summary_lbl, trig_list, _ in normal_cards:
+                extra_note = f" — *{trig_list[0]}*" if trig_list else " — *все показатели отсева и самочувствия в норме.*"
+                st.markdown(f"* **{icon} {pm['title_display']}** (удержание `{pm['cor_mod']:.1f}%`, отсев шага `{pm['drop_rate']:.1f}%`){extra_note}")
 
 
 # ---------------------------------------------------------------------
